@@ -769,7 +769,7 @@ func (m Model) View() tea.View {
 	}
 	if m.updateAvailable != nil {
 		b.WriteString(updateAvailableStyle.Render(
-			fmt.Sprintf("  v%s available!", m.updateAvailable.Version)))
+			fmt.Sprintf("  v%s available! (u to update)", m.updateAvailable.Version)))
 	} else {
 		b.WriteString(dimStyle.Render("  " + m.tagline))
 	}
@@ -1058,9 +1058,6 @@ func (m Model) renderHelpBar() string {
 	}
 	if m.sqlClient != "" {
 		keys = append(keys, struct{ key, desc string }{"\u23ce", m.sqlClient})
-	}
-	if m.updateAvailable != nil && !m.updating {
-		keys = append(keys, struct{ key, desc string }{"u", "update"})
 	}
 	keys = append(keys, []struct{ key, desc string }{
 		{"c", "configure"},
