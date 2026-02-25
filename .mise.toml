@@ -1,0 +1,23 @@
+[tools]
+go = "1.26"
+goreleaser = "latest"
+
+[tasks.build]
+description = "Build drillbit binary"
+run = "go build -o bin/drillbit ."
+
+[tasks.dev]
+description = "Build and run drillbit"
+run = "go build -o bin/drillbit . && ./bin/drillbit"
+
+[tasks.test]
+description = "Run tests"
+run = "go test -v -race ./..."
+
+[tasks.lint]
+description = "Run go vet"
+run = "go vet ./..."
+
+[tasks.release-local]
+description = "Test goreleaser build locally"
+run = "goreleaser build --snapshot --clean"

@@ -1,0 +1,28 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mise which go)",
+      "Bash(mise exec -- go version)",
+      "Bash(mise list go)",
+      "WebFetch(domain:github.com)",
+      "Bash(go mod init drillbit)",
+      "Bash(go list -m -versions github.com/charmbracelet/bubbletea)",
+      "Bash(go list -m -versions github.com/charmbracelet/bubbletea/v2)",
+      "Bash(go list -m -versions github.com/charmbracelet/bubbles/v2)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(go mod tidy)",
+      "Bash(go build -o bin/drillbit .)",
+      "Bash(go version)",
+      "Bash(go clean -cache)",
+      "Bash(go env GOROOT GOTOOLCHAIN GOPATH)",
+      "Bash(GOTOOLCHAIN=local go build -o bin/drillbit .)",
+      "Bash(GOROOT=/Users/jsc/.local/share/mise/installs/go/1.26.0 go build -o bin/drillbit .)",
+      "Bash(GOROOT=/Users/jsc/.local/share/mise/installs/go/1.26.0 go doc charm.land/bubbletea/v2 View)",
+      "Bash(GOROOT=/Users/jsc/.local/share/mise/installs/go/1.26.0 go doc charm.land/bubbletea/v2 NewView)",
+      "Bash(GOROOT=/Users/jsc/.local/share/mise/installs/go/1.26.0 go doc charm.land/bubbletea/v2 View.AltScreen)",
+      "Bash(/Users/jsc/tun/bin/drillbit --version)",
+      "Bash(/Users/jsc/tun/bin/drillbit --help)",
+      "Bash(GOROOT=/Users/jsc/.local/share/mise/installs/go/1.26.0 go vet ./...)"
+    ]
+  }
+}

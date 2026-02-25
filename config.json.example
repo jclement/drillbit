@@ -1,0 +1,16 @@
+{
+  "environments": {
+    "prod": [
+      {"host": "nyc1", "root": "/docker"},
+      {"host": "nyc2", "root": "/opt/services"},
+      "nyc3"
+    ],
+    "test": [
+      "test1"
+    ]
+  },
+  "autoconnect": [
+    ["nyc1", "acme-corp"],
+    ["test1", "my-app"]
+  ]
+}
