@@ -437,7 +437,9 @@ func (m *Model) updateEdit(msg tea.KeyPressMsg) []tea.Cmd {
 		}
 		cmds = append(cmds, m.clearFlashAfter(2*time.Second))
 
-		m.editFields[m.editFieldCursor].Blur()
+		if m.editFieldCursor < 3 {
+			m.editFields[m.editFieldCursor].Blur()
+		}
 		m.mode = modeNormal
 
 	case "space":
