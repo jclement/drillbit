@@ -1,8 +1,10 @@
 package main
 
 import (
+	"archive/tar"
 	"archive/zip"
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -110,8 +112,12 @@ func fetchLatestRelease() (*updateInfo, error) {
 	}
 
 	ver := strings.TrimPrefix(rel.TagName, "v")
-	wantName := fmt.Sprintf("drillbit_%s_%s_%s.zip",
-		ver, runtime.GOOS, runtime.GOARCH)
+	ext := "tar.gz"
+	if runtime.GOOS == "windows" {
+		ext = "zip"
+	}
+	wantName := fmt.Sprintf("drillbit_%s_%s_%s.%s",
+		ver, runtime.GOOS, runtime.GOARCH, ext)
 
 	var assetURL, assetName string
 	for _, a := range rel.Assets {
@@ -157,13 +163,17 @@ func doUpdate(info updateInfo) error {
 		return fmt.Errorf("download: HTTP %s", resp.Status)
 	}
 
-	// Read entire zip into memory (archive/zip needs random access).
-	zipData, err := io.ReadAll(resp.Body)
+	archiveData, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return fmt.Errorf("download: %w", err)
 	}
 
-	binaryData, err := extractBinaryFromZip(zipData)
+	var binaryData []byte
+	if strings.HasSuffix(info.AssetName, ".zip") {
+		binaryData, err = extractBinaryFromZip(archiveData)
+	} else {
+		binaryData, err = extractBinaryFromTarGz(archiveData)
+	}
 	if err != nil {
 		return err
 	}
@@ -236,7 +246,32 @@ func extractBinaryFromZip(data []byte) ([]byte, error) {
 		}
 	}
 
-	return nil, fmt.Errorf("binary %q not found in archive", want)
+	return nil, fmt.Errorf("binary %q not found in zip archive", want)
+}
+
+// extractBinaryFromTarGz finds the drillbit binary inside a tar.gz archive.
+func extractBinaryFromTarGz(data []byte) ([]byte, error) {
+	gzr, err := gzip.NewReader(bytes.NewReader(data))
+	if err != nil {
+		return nil, fmt.Errorf("gzip: %w", err)
+	}
+	defer gzr.Close()
+
+	tr := tar.NewReader(gzr)
+	want := binaryName()
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("tar: %w", err)
+		}
+		if filepath.Base(hdr.Name) == want {
+			return io.ReadAll(tr)
+		}
+	}
+	return nil, fmt.Errorf("binary %q not found in tar.gz archive", want)
 }
 
 // resolveExecPath follows symlinks to find the real binary path.
