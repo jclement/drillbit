@@ -23,7 +23,7 @@ const (
 	modeCopy
 	modeConfirmQuit
 	modeConfig
-	modeEdit // edit selected entry (user, pw, db)
+	modeEdit // edit selected entry (user, pw, db, autoconnect)
 )
 
 // flashMsg is used to clear the status flash after a delay.
@@ -32,6 +32,11 @@ type flashMsg struct{}
 // sqlClientErrorMsg is sent when pgcli/psql exits with an error.
 // Separate from tunnelErrorMsg so the tunnel stays connected.
 type sqlClientErrorMsg struct{ err error }
+
+// tunnelHealthMsg is sent periodically to check tunnel health.
+type tunnelHealthMsg struct{}
+
+const healthCheckInterval = 30 * time.Second
 
 // Model is the main bubbletea model.
 type Model struct {
@@ -51,6 +56,7 @@ type Model struct {
 	// Edit mode fields (for editing selected entry's user/pw/db).
 	editFields      [3]textinput.Model
 	editFieldCursor int
+	editAutoconnect bool // toggle in edit form
 
 	width  int
 	height int
@@ -62,6 +68,10 @@ type Model struct {
 	tagline       string // random tagline picked at startup
 	sqlClient     string // "pgcli", "psql", or "" if neither found
 	pendingLaunch string // tunnel key to auto-launch SQL client once connected
+
+	// Update tracking.
+	updateAvailable *updateInfo
+	updating        bool
 }
 
 func newModel(cfg *Config, configPath string) Model {
@@ -100,7 +110,11 @@ func (s entrySource) Len() int { return len(s.indices) }
 // --- Init ---
 
 func (m Model) Init() tea.Cmd {
-	return discoverAll(m.cfg)
+	return tea.Batch(
+		discoverAll(m.cfg),
+		checkForUpdate(),
+		m.scheduleHealthCheck(),
+	)
 }
 
 // --- Update ---
@@ -176,6 +190,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			e.Status = StatusReady
 			e.Error = ""
 		}
+
+	case updateAvailableMsg:
+		m.updateAvailable = &msg.info
+
+	case updateDoneMsg:
+		m.updating = false
+		if msg.err != nil {
+			m.flash = errorMsgStyle.Render(fmt.Sprintf("Update failed: %v", msg.err))
+			cmds = append(cmds, m.clearFlashAfter(5*time.Second))
+		} else {
+			m.flash = flashStyle.Render(fmt.Sprintf("Updated to v%s — restart to use new version", msg.newVersion))
+			m.updateAvailable = nil
+			cmds = append(cmds, m.clearFlashAfter(10*time.Second))
+		}
+
+	case tunnelHealthMsg:
+		cmds = append(cmds, m.checkTunnelHealth()...)
+		cmds = append(cmds, m.scheduleHealthCheck())
 
 	case flashMsg:
 		m.flash = ""
@@ -291,19 +323,6 @@ func (m *Model) updateNormal(msg tea.KeyPressMsg) []tea.Cmd {
 			}
 		}
 
-	case "*":
-		if e := m.selectedEntry(); e != nil {
-			m.toggleAutoconnect(e)
-			if err := SaveConfig(m.cfg, m.configPath); err != nil {
-				m.flash = errorMsgStyle.Render(fmt.Sprintf("Save: %v", err))
-			} else if m.isAutoconnect(e) {
-				m.flash = flashStyle.Render("Autoconnect enabled")
-			} else {
-				m.flash = flashStyle.Render("Autoconnect disabled")
-			}
-			cmds = append(cmds, m.clearFlashAfter(2*time.Second))
-		}
-
 	case "y":
 		if m.selectedEntry() != nil {
 			m.mode = modeCopy
@@ -317,6 +336,13 @@ func (m *Model) updateNormal(msg tea.KeyPressMsg) []tea.Cmd {
 	case "h":
 		m.editor = newConfigEditor(m.cfg)
 		m.mode = modeConfig
+
+	case "u":
+		if m.updateAvailable != nil && !m.updating {
+			m.updating = true
+			m.flash = flashStyle.Render("Downloading update...")
+			cmds = append(cmds, performUpdate(*m.updateAvailable))
+		}
 
 	case "r":
 		m.discovering = true
@@ -335,6 +361,7 @@ func (m *Model) updateNormal(msg tea.KeyPressMsg) []tea.Cmd {
 // startEdit initializes the edit form for the selected entry.
 func (m *Model) startEdit(e *Entry) {
 	m.editFieldCursor = 0
+	m.editAutoconnect = m.isAutoconnect(e)
 
 	m.editFields[0] = textinput.New()
 	m.editFields[0].Placeholder = "postgres"
@@ -360,7 +387,9 @@ func (m *Model) updateEdit(msg tea.KeyPressMsg) []tea.Cmd {
 
 	switch msg.String() {
 	case "ctrl+c", "esc":
-		m.editFields[m.editFieldCursor].Blur()
+		if m.editFieldCursor < 3 {
+			m.editFields[m.editFieldCursor].Blur()
+		}
 		m.mode = modeNormal
 
 	case "enter":
@@ -392,6 +421,15 @@ func (m *Model) updateEdit(msg tea.KeyPressMsg) []tea.Cmd {
 			Password: pw,
 			Database: db,
 		}
+
+		// Update autoconnect.
+		wasAuto := m.isAutoconnect(e)
+		if m.editAutoconnect && !wasAuto {
+			m.toggleAutoconnect(e)
+		} else if !m.editAutoconnect && wasAuto {
+			m.toggleAutoconnect(e)
+		}
+
 		if err := SaveConfig(m.cfg, m.configPath); err != nil {
 			m.flash = errorMsgStyle.Render(fmt.Sprintf("Save: %v", err))
 		} else {
@@ -402,21 +440,44 @@ func (m *Model) updateEdit(msg tea.KeyPressMsg) []tea.Cmd {
 		m.editFields[m.editFieldCursor].Blur()
 		m.mode = modeNormal
 
-	case "tab":
-		m.editFields[m.editFieldCursor].Blur()
-		m.editFieldCursor = (m.editFieldCursor + 1) % 3
-		m.editFields[m.editFieldCursor].Focus()
-
-	case "shift+tab":
-		m.editFields[m.editFieldCursor].Blur()
-		m.editFieldCursor = (m.editFieldCursor + 2) % 3
-		m.editFields[m.editFieldCursor].Focus()
-
-	default:
+	case "space":
+		// Toggle autoconnect when on the autoconnect field.
+		if m.editFieldCursor == 3 {
+			m.editAutoconnect = !m.editAutoconnect
+			return nil
+		}
+		// Otherwise pass through to textinput.
 		var cmd tea.Cmd
 		m.editFields[m.editFieldCursor], cmd = m.editFields[m.editFieldCursor].Update(msg)
 		if cmd != nil {
 			cmds = append(cmds, cmd)
+		}
+
+	case "tab":
+		if m.editFieldCursor < 3 {
+			m.editFields[m.editFieldCursor].Blur()
+		}
+		m.editFieldCursor = (m.editFieldCursor + 1) % 4
+		if m.editFieldCursor < 3 {
+			m.editFields[m.editFieldCursor].Focus()
+		}
+
+	case "shift+tab":
+		if m.editFieldCursor < 3 {
+			m.editFields[m.editFieldCursor].Blur()
+		}
+		m.editFieldCursor = (m.editFieldCursor + 3) % 4
+		if m.editFieldCursor < 3 {
+			m.editFields[m.editFieldCursor].Focus()
+		}
+
+	default:
+		if m.editFieldCursor < 3 {
+			var cmd tea.Cmd
+			m.editFields[m.editFieldCursor], cmd = m.editFields[m.editFieldCursor].Update(msg)
+			if cmd != nil {
+				cmds = append(cmds, cmd)
+			}
 		}
 	}
 
@@ -653,6 +714,31 @@ func (m *Model) clearFlashAfter(d time.Duration) tea.Cmd {
 	})
 }
 
+// scheduleHealthCheck schedules the next tunnel health check.
+func (m *Model) scheduleHealthCheck() tea.Cmd {
+	return tea.Tick(healthCheckInterval, func(time.Time) tea.Msg {
+		return tunnelHealthMsg{}
+	})
+}
+
+// checkTunnelHealth pings connected tunnels and reconnects dead ones.
+func (m *Model) checkTunnelHealth() []tea.Cmd {
+	var cmds []tea.Cmd
+	for i := range m.entries {
+		e := &m.entries[i]
+		if e.Status != StatusConnected {
+			continue
+		}
+		key := tunnelKey(e)
+		if !m.tunnels.IsAlive(key) {
+			e.Status = StatusConnecting
+			e.Error = ""
+			cmds = append(cmds, m.tunnels.Connect(e))
+		}
+	}
+	return cmds
+}
+
 // --- View ---
 
 func altView(s string) tea.View {
@@ -664,7 +750,7 @@ func altView(s string) tea.View {
 func (m Model) View() tea.View {
 	// Full-screen overlays.
 	if m.mode == modeHelp {
-		return altView(renderHelp(m.width, m.height, m.sqlClient))
+		return altView(renderHelp(m.width, m.height, m.sqlClient, m.updateAvailable != nil))
 	}
 	if m.mode == modeConfig {
 		return altView(m.editor.view(m.width))
@@ -679,7 +765,12 @@ func (m Model) View() tea.View {
 	if version != "dev" {
 		b.WriteString(dimStyle.Render("  v" + version))
 	}
-	b.WriteString(dimStyle.Render("  " + m.tagline))
+	if m.updateAvailable != nil {
+		b.WriteString(updateAvailableStyle.Render(
+			fmt.Sprintf("  v%s available!", m.updateAvailable.Version)))
+	} else {
+		b.WriteString(dimStyle.Render("  " + m.tagline))
+	}
 	b.WriteString("\n\n")
 
 	// Discovery errors.
@@ -770,30 +861,54 @@ func (m Model) calcColumns() colWidths {
 	if w < 60 {
 		w = 80
 	}
-	// Fixed columns: env(6) + auto(4) + pw(2) + port(7) + padding/status(~20)
-	fixed := 6 + 4 + 2 + 7 + 20
-	remaining := w - fixed
-	if remaining < 40 {
-		remaining = 40
+
+	// Start with header label lengths as minimums.
+	cw := colWidths{
+		env: 3, host: 4, tenant: 6, auto: 4,
+		user: 4, pw: 2, db: 2, port: 4,
 	}
-	// Split: host 20%, tenant 30%, user 20%, db 30%
-	hostW := remaining * 20 / 100
-	tenantW := remaining * 30 / 100
-	userW := remaining * 20 / 100
-	dbW := remaining - hostW - tenantW - userW
-	if hostW < 8 {
-		hostW = 8
+
+	// Scan visible entries to find max content width per column.
+	for _, idx := range m.filtered {
+		e := m.entries[idx]
+		cw.env = max(cw.env, len(strings.ToUpper(e.Env)))
+		cw.host = max(cw.host, len(e.Host))
+		cw.tenant = max(cw.tenant, len(e.Tenant))
+		cw.user = max(cw.user, len(e.DBUser))
+		cw.db = max(cw.db, len(e.Database))
+		cw.port = max(cw.port, len(fmt.Sprintf("%d", e.LocalPort)))
 	}
-	if tenantW < 8 {
-		tenantW = 8
+
+	// Add 2 chars padding per column for breathing room.
+	cw.env += 2
+	cw.host += 2
+	cw.tenant += 2
+	cw.user += 2
+	cw.db += 2
+
+	// 2-char indent + 1 space between each of 9 columns + 1 space before status.
+	overhead := 2 + 9
+	contentTotal := cw.env + cw.host + cw.tenant + cw.auto + cw.user + cw.pw + cw.db + cw.port
+
+	// Reserve space for status ("✖ Error: some message..." ≈ 20 chars minimum).
+	minStatus := 20
+	if contentTotal+overhead+minStatus > w {
+		// Shrink elastic columns (host, tenant, user, db) proportionally.
+		fixedCols := cw.env + cw.auto + cw.pw + cw.port
+		budget := w - overhead - minStatus - fixedCols
+		if budget < 16 {
+			budget = 16
+		}
+		elastic := cw.host + cw.tenant + cw.user + cw.db
+		if elastic > budget {
+			cw.host = max(4, cw.host*budget/elastic)
+			cw.tenant = max(4, cw.tenant*budget/elastic)
+			cw.user = max(4, cw.user*budget/elastic)
+			cw.db = max(4, budget-cw.host-cw.tenant-cw.user)
+		}
 	}
-	if userW < 6 {
-		userW = 6
-	}
-	if dbW < 6 {
-		dbW = 6
-	}
-	return colWidths{env: 6, host: hostW, tenant: tenantW, auto: 4, user: userW, pw: 2, db: dbW, port: 7}
+
+	return cw
 }
 
 // renderTable draws the table with per-row environment coloring.
@@ -920,6 +1035,17 @@ func (m Model) renderEditForm() string {
 		}
 	}
 
+	// Autoconnect toggle.
+	check := "[ ]"
+	if m.editAutoconnect {
+		check = "[*]"
+	}
+	if m.editFieldCursor == 3 {
+		b.WriteString(helpKeyStyle.Render("> ") + dimStyle.Render("Autoconnect: ") + helpKeyStyle.Render(check) + "\n")
+	} else {
+		b.WriteString(dimStyle.Render("  Autoconnect: "+check) + "\n")
+	}
+
 	return b.String()
 }
 
@@ -931,8 +1057,10 @@ func (m Model) renderHelpBar() string {
 	if m.sqlClient != "" {
 		keys = append(keys, struct{ key, desc string }{"\u23ce", m.sqlClient})
 	}
+	if m.updateAvailable != nil && !m.updating {
+		keys = append(keys, struct{ key, desc string }{"u", "update"})
+	}
 	keys = append(keys, []struct{ key, desc string }{
-		{"*", "auto"},
 		{"c", "configure"},
 		{"y", "copy"},
 		{"/", "filter"},
@@ -970,6 +1098,7 @@ func (m Model) renderCopyPrompt() string {
 func (m Model) renderEditBar() string {
 	return "  " +
 		helpKeyStyle.Render("Tab") + helpBarStyle.Render(":next field") + "  " +
+		helpKeyStyle.Render("Space") + helpBarStyle.Render(":toggle auto") + "  " +
 		helpKeyStyle.Render("Enter") + helpBarStyle.Render(":save") + "  " +
 		helpKeyStyle.Render("Esc") + helpBarStyle.Render(":cancel")
 }

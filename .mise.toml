@@ -26,74 +26,58 @@ description = "Run go vet"
 run = "go vet ./..."
 
 [tasks.release]
-description = "Interactive release: bump version, tag, and push to trigger GitHub Action"
+description = "Interactive release: bump version, tag, and push"
 run = """
 #!/bin/bash
 set -e
 
-# Get current version from git tags
 CURRENT_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
 echo "Current version: $CURRENT_TAG"
 
-# Parse version components
 VERSION_NUM=${CURRENT_TAG#v}
 IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION_NUM"
 
-# Calculate next versions
 NEXT_PATCH="v$MAJOR.$MINOR.$((PATCH + 1))"
 NEXT_MINOR="v$MAJOR.$((MINOR + 1)).0"
 NEXT_MAJOR="v$((MAJOR + 1)).0.0"
 
 echo ""
-echo "Select version bump:"
-echo "  1) Patch  -> $NEXT_PATCH"
-echo "  2) Minor  -> $NEXT_MINOR"
-echo "  3) Major  -> $NEXT_MAJOR"
-echo "  4) Custom"
-echo "  5) Cancel"
+echo "Select release type:"
+echo "  1) patch  → $NEXT_PATCH"
+echo "  2) minor  → $NEXT_MINOR"
+echo "  3) major  → $NEXT_MAJOR"
+echo "  q) quit"
 echo ""
-read -p "Choice [1-5]: " CHOICE
+read -p "Choice [1]: " CHOICE
+CHOICE=${CHOICE:-1}
 
 case $CHOICE in
     1) NEW_VERSION=$NEXT_PATCH ;;
     2) NEW_VERSION=$NEXT_MINOR ;;
     3) NEW_VERSION=$NEXT_MAJOR ;;
-    4) read -p "Enter version (e.g., v1.2.3): " NEW_VERSION ;;
-    5) echo "Cancelled."; exit 0 ;;
+    q|Q) echo "Cancelled."; exit 0 ;;
     *) echo "Invalid choice"; exit 1 ;;
 esac
 
-# Validate version format
-if [[ ! $NEW_VERSION =~ ^v[0-9]+\\.[0-9]+\\.[0-9]+$ ]]; then
-    echo "Error: Version must be in format v1.2.3"
-    exit 1
-fi
-
 echo ""
-echo "Will create and push release: $NEW_VERSION"
-read -p "Continue? [y/N]: " CONFIRM
+echo "Creating release: $NEW_VERSION"
+git tag -a "$NEW_VERSION" -m "Release $NEW_VERSION"
+echo "Created tag: $NEW_VERSION"
+
+read -p "Push tag to origin? [Y/n]: " CONFIRM
+CONFIRM=${CONFIRM:-Y}
 if [[ ! $CONFIRM =~ ^[Yy]$ ]]; then
-    echo "Cancelled."
+    git tag -d "$NEW_VERSION" >/dev/null 2>&1
+    echo "Cancelled. Tag removed."
     exit 0
 fi
 
-# Create and push git tag
-echo ""
-echo "Creating git tag $NEW_VERSION..."
-git tag -a "$NEW_VERSION" -m "Release $NEW_VERSION"
-
-echo "Pushing tag to origin..."
 git push origin "$NEW_VERSION"
-
-echo ""
-echo "Release $NEW_VERSION tagged and pushed!"
-echo "GitHub Action will build and publish the Docker image."
-echo ""
-echo "Watch progress: https://github.com/jclement/drillbit/actions"
+echo "Tag pushed! GitHub Actions will build and release."
 """
 
 [tasks."release:all"]
-description = "Build release binaries for all platforms"
+description = "Build release binaries for all platforms (local)"
 run = """
 VERSION=${VERSION:-$(git describe --tags --always --dirty 2>/dev/null || echo "dev")}
 COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")

@@ -25,7 +25,9 @@
       "Bash(GOROOT=/Users/jsc/.local/share/mise/installs/go/1.26.0 go vet ./...)",
       "Bash(go build ./...)",
       "Bash(ls -la /Users/jsc/go/pkg/mod/charm.land/bubbletea*/)",
-      "Bash(GOROOT=/Users/jsc/.local/share/mise/installs/go/1.26.0 /Users/jsc/.local/share/mise/installs/go/1.26.0/bin/go build ./...)"
+      "Bash(GOROOT=/Users/jsc/.local/share/mise/installs/go/1.26.0 /Users/jsc/.local/share/mise/installs/go/1.26.0/bin/go build ./...)",
+      "Bash(GOROOT=$HOME/.local/share/mise/installs/go/1.26.0 PATH=\"$GOROOT/bin:$PATH\" go build ./...)",
+      "Bash(GOROOT=$HOME/.local/share/mise/installs/go/1.26.0 PATH=\"$GOROOT/bin:$PATH\" go build -o /dev/null /Users/jsc/tun/.)"
     ]
   }
 }

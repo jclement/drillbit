@@ -129,15 +129,31 @@ func (tm *TunnelManager) MonitorTunnel(key string) tea.Cmd {
 		}
 
 		err := <-tun.done
+
 		tm.mu.Lock()
+		_, stillTracked := tm.tunnels[key]
 		delete(tm.tunnels, key)
 		tm.mu.Unlock()
+
+		// If Disconnect already removed it, this was deliberate — don't report.
+		if !stillTracked {
+			return nil
+		}
 
 		if err != nil {
 			return tunnelErrorMsg{key: key, err: fmt.Errorf("tunnel died: %w", err)}
 		}
 		return tunnelDisconnectedMsg{key: key}
 	}
+}
+
+// IsAlive checks if a tunnel is still tracked (not dead/disconnected).
+// Does NOT read from the done channel to avoid racing with MonitorTunnel.
+func (tm *TunnelManager) IsAlive(key string) bool {
+	tm.mu.Lock()
+	_, ok := tm.tunnels[key]
+	tm.mu.Unlock()
+	return ok
 }
 
 // DisconnectAll tears down all active tunnels.

@@ -94,6 +94,11 @@ var (
 			Bold(true).
 			Foreground(lipgloss.Color("#e94560")).
 			MarginBottom(1)
+
+	// Update available indicator.
+	updateAvailableStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#51CF66")).
+				Bold(true)
 )
 
 // envRowStyle returns the style for a row based on its environment.

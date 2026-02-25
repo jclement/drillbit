@@ -16,8 +16,7 @@ var helpBindingsBase = []helpBinding{
 }
 
 var helpBindingsAfterSQL = []helpBinding{
-	{"*", "Toggle autoconnect"},
-	{"c", "Configure selected entry (user, pw, db)"},
+	{"c", "Configure selected (user, pw, db, auto)"},
 	{"y", "Copy to clipboard (then p or c)"},
 	{"/", "Filter"},
 	{"h", "Manage hosts"},
@@ -28,7 +27,7 @@ var helpBindingsAfterSQL = []helpBinding{
 	{"Esc", "Quit (confirms if connected)"},
 }
 
-func renderHelp(width, height int, sqlClient string) string {
+func renderHelp(width, height int, sqlClient string, updateAvailable bool) string {
 	bindings := make([]helpBinding, len(helpBindingsBase))
 	copy(bindings, helpBindingsBase)
 	if sqlClient != "" {
@@ -37,6 +36,9 @@ func renderHelp(width, height int, sqlClient string) string {
 		bindings = append(bindings, helpBinding{"Enter", "Connect"})
 	}
 	bindings = append(bindings, helpBindingsAfterSQL...)
+	if updateAvailable {
+		bindings = append(bindings, helpBinding{"u", "Update to latest version"})
+	}
 
 	s := helpTitleStyle.Render("Keybindings") + "\n\n"
 	for _, b := range bindings {
