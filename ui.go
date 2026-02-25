@@ -10,6 +10,7 @@ import (
 
 	"charm.land/bubbles/v2/textinput"
 	tea "charm.land/bubbletea/v2"
+	"github.com/atotto/clipboard"
 	"github.com/sahilm/fuzzy"
 )
 
@@ -28,6 +29,9 @@ const (
 
 // flashMsg is used to clear the status flash after a delay.
 type flashMsg struct{}
+
+// clipboardClearMsg is sent to wipe the clipboard after a timeout.
+type clipboardClearMsg struct{}
 
 // sqlClientErrorMsg is sent when pgcli/psql exits with an error.
 // Separate from tunnelErrorMsg so the tunnel stays connected.
@@ -208,6 +212,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tunnelHealthMsg:
 		cmds = append(cmds, m.checkTunnelHealth()...)
 		cmds = append(cmds, m.scheduleHealthCheck())
+
+	case clipboardClearMsg:
+		clipboard.WriteAll("")
 
 	case flashMsg:
 		m.flash = ""
@@ -534,7 +541,8 @@ func (m *Model) updateCopy(msg tea.KeyPressMsg) []tea.Cmd {
 			if err := CopyPassword(e); err != nil {
 				m.flash = errorMsgStyle.Render(err.Error())
 			} else {
-				m.flash = flashStyle.Render("Password copied!")
+				m.flash = flashStyle.Render("Password copied! (clipboard clears in 30s)")
+				cmds = append(cmds, m.clearClipboardAfter(30*time.Second))
 			}
 			cmds = append(cmds, m.clearFlashAfter(2*time.Second))
 		}
@@ -545,7 +553,8 @@ func (m *Model) updateCopy(msg tea.KeyPressMsg) []tea.Cmd {
 			} else if err := CopyConnStr(e); err != nil {
 				m.flash = errorMsgStyle.Render(err.Error())
 			} else {
-				m.flash = flashStyle.Render("Connection string copied!")
+				m.flash = flashStyle.Render("Connection string copied! (clipboard clears in 30s)")
+				cmds = append(cmds, m.clearClipboardAfter(30*time.Second))
 			}
 			cmds = append(cmds, m.clearFlashAfter(2*time.Second))
 		}
@@ -713,6 +722,12 @@ func (m *Model) launchSQLClient(e *Entry) tea.Cmd {
 func (m *Model) clearFlashAfter(d time.Duration) tea.Cmd {
 	return tea.Tick(d, func(time.Time) tea.Msg {
 		return flashMsg{}
+	})
+}
+
+func (m *Model) clearClipboardAfter(d time.Duration) tea.Cmd {
+	return tea.Tick(d, func(time.Time) tea.Msg {
+		return clipboardClearMsg{}
 	})
 }
 
