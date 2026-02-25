@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"math/rand"
 	"net/url"
 	"os"
 	"os/exec"
@@ -10,6 +11,7 @@ import (
 
 	"charm.land/bubbles/v2/textinput"
 	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 	"github.com/atotto/clipboard"
 	"github.com/sahilm/fuzzy"
 )
@@ -24,7 +26,8 @@ const (
 	modeCopy
 	modeConfirmQuit
 	modeConfig
-	modeEdit // edit selected entry (user, pw, db, autoconnect)
+	modeEdit     // edit selected entry (user, pw, db, autoconnect)
+	modeQuitting // dissolve animation during shutdown
 )
 
 // flashMsg is used to clear the status flash after a delay.
@@ -32,6 +35,18 @@ type flashMsg struct{}
 
 // clipboardClearMsg is sent to wipe the clipboard after a timeout.
 type clipboardClearMsg struct{}
+
+type dissolveTickMsg struct{}
+type shutdownDoneMsg struct{}
+
+// dissolveState tracks the shutdown dissolve animation.
+type dissolveState struct {
+	grid     [][]rune
+	cells    [][2]int // non-space cells in random dissolve order
+	pos      int
+	batchSz  int
+	shutdown bool
+}
 
 // sqlClientErrorMsg is sent when pgcli/psql exits with an error.
 // Separate from tunnelErrorMsg so the tunnel stays connected.
@@ -76,6 +91,9 @@ type Model struct {
 	// Update tracking.
 	updateAvailable *updateInfo
 	updating        bool
+
+	// Shutdown dissolve animation.
+	dissolve *dissolveState
 }
 
 func newModel(cfg *Config, configPath string) Model {
@@ -216,11 +234,58 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case clipboardClearMsg:
 		clipboard.WriteAll("")
 
+	case dissolveTickMsg:
+		if d := m.dissolve; d != nil {
+			end := min(d.pos+d.batchSz, len(d.cells))
+			for i := d.pos; i < end; i++ {
+				r, c := d.cells[i][0], d.cells[i][1]
+				if r < len(d.grid) && c < len(d.grid[r]) {
+					d.grid[r][c] = ' '
+				}
+			}
+			d.pos = end
+			if d.pos >= len(d.cells) && d.shutdown {
+				return m, tea.Quit
+			}
+			cmds = append(cmds, tea.Tick(35*time.Millisecond, func(time.Time) tea.Msg {
+				return dissolveTickMsg{}
+			}))
+		}
+
+	case shutdownDoneMsg:
+		if m.dissolve != nil {
+			m.dissolve.shutdown = true
+			if m.dissolve.pos >= len(m.dissolve.cells) {
+				return m, tea.Quit
+			}
+		}
+
 	case flashMsg:
 		m.flash = ""
 
+	case tea.PasteMsg:
+		switch m.mode {
+		case modeEdit:
+			if m.editFieldCursor < 3 {
+				var cmd tea.Cmd
+				m.editFields[m.editFieldCursor], cmd = m.editFields[m.editFieldCursor].Update(msg)
+				if cmd != nil {
+					cmds = append(cmds, cmd)
+				}
+			}
+		case modeConfig:
+			cmd := m.editor.updatePaste(msg)
+			if cmd != nil {
+				cmds = append(cmds, cmd)
+			}
+		}
+
 	case tea.KeyPressMsg:
 		switch m.mode {
+		case modeQuitting:
+			if msg.String() == "ctrl+c" {
+				return m, tea.Quit
+			}
 		case modeConfig:
 			done, save, cmd := m.editor.update(msg)
 			if cmd != nil {
@@ -265,7 +330,9 @@ func (m *Model) updateNormal(msg tea.KeyPressMsg) []tea.Cmd {
 
 	switch msg.String() {
 	case "ctrl+c":
-		m.tunnels.DisconnectAll()
+		if m.activeConnectionCount() > 0 {
+			return m.startDissolve()
+		}
 		return []tea.Cmd{tea.Quit}
 
 	case "esc":
@@ -373,16 +440,19 @@ func (m *Model) startEdit(e *Entry) {
 	m.editFields[0] = textinput.New()
 	m.editFields[0].Placeholder = "postgres"
 	m.editFields[0].CharLimit = 64
+	m.editFields[0].SetWidth(30)
 	m.editFields[0].SetValue(e.DBUser)
 
 	m.editFields[1] = textinput.New()
 	m.editFields[1].Placeholder = "(password)"
 	m.editFields[1].CharLimit = 256
+	m.editFields[1].SetWidth(30)
 	m.editFields[1].SetValue(e.Password)
 
 	m.editFields[2] = textinput.New()
 	m.editFields[2].Placeholder = e.Tenant
 	m.editFields[2].CharLimit = 128
+	m.editFields[2].SetWidth(30)
 	m.editFields[2].SetValue(e.Database)
 
 	m.editFields[0].Focus()
@@ -566,8 +636,7 @@ func (m *Model) updateCopy(msg tea.KeyPressMsg) []tea.Cmd {
 func (m *Model) updateConfirmQuit(msg tea.KeyPressMsg) []tea.Cmd {
 	switch msg.String() {
 	case "esc":
-		m.tunnels.DisconnectAll()
-		return []tea.Cmd{tea.Quit}
+		return m.startDissolve()
 	default:
 		m.mode = modeNormal
 		return nil
@@ -731,6 +800,80 @@ func (m *Model) clearClipboardAfter(d time.Duration) tea.Cmd {
 	})
 }
 
+// stripANSI removes ANSI escape sequences from a string.
+func stripANSI(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\x1b' && i+1 < len(s) && s[i+1] == '[' {
+			i += 2
+			for i < len(s) && !((s[i] >= 'A' && s[i] <= 'Z') || (s[i] >= 'a' && s[i] <= 'z')) {
+				i++
+			}
+		} else {
+			b.WriteByte(s[i])
+		}
+	}
+	return b.String()
+}
+
+// startDissolve captures the screen, starts async disconnect, and begins the dissolve animation.
+func (m *Model) startDissolve() []tea.Cmd {
+	plain := stripANSI(m.buildMainView())
+	lines := strings.Split(plain, "\n")
+
+	grid := make([][]rune, len(lines))
+	var cells [][2]int
+	for r, line := range lines {
+		grid[r] = []rune(line)
+		for c, ch := range grid[r] {
+			if ch != ' ' {
+				cells = append(cells, [2]int{r, c})
+			}
+		}
+	}
+
+	rand.Shuffle(len(cells), func(i, j int) {
+		cells[i], cells[j] = cells[j], cells[i]
+	})
+
+	batchSz := len(cells) / 40 // ~40 frames at 35ms ≈ 1.4s
+	if batchSz < 1 {
+		batchSz = 1
+	}
+
+	m.dissolve = &dissolveState{
+		grid:    grid,
+		cells:   cells,
+		batchSz: batchSz,
+	}
+	m.mode = modeQuitting
+
+	return []tea.Cmd{
+		func() tea.Msg {
+			m.tunnels.DisconnectAll()
+			return shutdownDoneMsg{}
+		},
+		tea.Tick(35*time.Millisecond, func(time.Time) tea.Msg {
+			return dissolveTickMsg{}
+		}),
+	}
+}
+
+// renderDissolve renders the dissolving screen in the accent color.
+func (m Model) renderDissolve() string {
+	if m.dissolve == nil {
+		return ""
+	}
+	style := lipgloss.NewStyle().Foreground(lipgloss.Color("#e94560"))
+	var b strings.Builder
+	for _, line := range m.dissolve.grid {
+		b.WriteString(style.Render(string(line)))
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
 // scheduleHealthCheck schedules the next tunnel health check.
 func (m *Model) scheduleHealthCheck() tea.Cmd {
 	return tea.Tick(healthCheckInterval, func(time.Time) tea.Msg {
@@ -772,7 +915,13 @@ func (m Model) View() tea.View {
 	if m.mode == modeConfig {
 		return altView(m.editor.view(m.width))
 	}
+	if m.mode == modeQuitting {
+		return altView(m.renderDissolve())
+	}
+	return altView(m.buildMainView())
+}
 
+func (m Model) buildMainView() string {
 	var b strings.Builder
 
 	// Header.
@@ -800,13 +949,13 @@ func (m Model) View() tea.View {
 
 	if m.discovering {
 		b.WriteString("  " + dimStyle.Render("Discovering databases...") + "\n")
-		return altView(b.String())
+		return b.String()
 	}
 
 	if len(m.entries) == 0 && len(m.discErrors) == 0 {
 		b.WriteString("  " + dimStyle.Render("No databases found.") + "\n")
 		b.WriteString("  " + dimStyle.Render("Check your config: "+DefaultConfigPath()) + "\n")
-		return altView(b.String())
+		return b.String()
 	}
 
 	// Stats line.
@@ -865,7 +1014,7 @@ func (m Model) View() tea.View {
 	}
 	b.WriteString("\n")
 
-	return altView(b.String())
+	return b.String()
 }
 
 // colWidths computes responsive column widths based on terminal width.

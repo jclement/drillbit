@@ -43,18 +43,22 @@ func newConfigEditor(cfg *Config) configEditor {
 	fields[0] = textinput.New()
 	fields[0].Placeholder = "e.g. prod, test, staging"
 	fields[0].CharLimit = 20
+	fields[0].SetWidth(30)
 
 	fields[1] = textinput.New()
 	fields[1].Placeholder = "SSH host alias or hostname"
 	fields[1].CharLimit = 64
+	fields[1].SetWidth(30)
 
 	fields[2] = textinput.New()
 	fields[2].Placeholder = "(optional)"
 	fields[2].CharLimit = 32
+	fields[2].SetWidth(30)
 
 	fields[3] = textinput.New()
 	fields[3].Placeholder = "/docker"
 	fields[3].CharLimit = 128
+	fields[3].SetWidth(30)
 
 	return configEditor{
 		hosts:  hosts,
@@ -134,6 +138,15 @@ func (ed *configEditor) updateList(msg tea.KeyPressMsg) bool {
 		}
 	}
 	return false
+}
+
+func (ed *configEditor) updatePaste(msg tea.Msg) tea.Cmd {
+	if ed.mode != editorAdd {
+		return nil
+	}
+	var cmd tea.Cmd
+	ed.fields[ed.fieldCursor], cmd = ed.fields[ed.fieldCursor].Update(msg)
+	return cmd
 }
 
 func (ed *configEditor) updateAdd(msg tea.KeyPressMsg) tea.Cmd {
