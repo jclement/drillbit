@@ -1,13 +1,14 @@
 package main
 
 import (
-	"archive/tar"
-	"compress/gzip"
+	"archive/zip"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -28,7 +29,7 @@ type updateInfo struct {
 	TagName   string // e.g. "v1.2.3"
 	HTMLURL   string // GitHub release page URL
 	AssetURL  string // direct download URL for the correct archive
-	AssetName string // e.g. "drillbit_1.2.3_darwin_arm64.tar.gz"
+	AssetName string // e.g. "drillbit_1.2.3_darwin_arm64.zip"
 }
 
 // --- Bubbletea messages ---
@@ -51,6 +52,14 @@ type ghRelease struct {
 type ghAsset struct {
 	Name               string `json:"name"`
 	BrowserDownloadURL string `json:"browser_download_url"`
+}
+
+// binaryName returns the expected binary name for the current platform.
+func binaryName() string {
+	if runtime.GOOS == "windows" {
+		return "drillbit.exe"
+	}
+	return "drillbit"
 }
 
 // checkForUpdate queries GitHub for the latest release.
@@ -101,7 +110,7 @@ func fetchLatestRelease() (*updateInfo, error) {
 	}
 
 	ver := strings.TrimPrefix(rel.TagName, "v")
-	wantName := fmt.Sprintf("drillbit_%s_%s_%s.tar.gz",
+	wantName := fmt.Sprintf("drillbit_%s_%s_%s.zip",
 		ver, runtime.GOOS, runtime.GOARCH)
 
 	var assetURL, assetName string
@@ -148,65 +157,93 @@ func doUpdate(info updateInfo) error {
 		return fmt.Errorf("download: HTTP %s", resp.Status)
 	}
 
-	// Extract the "drillbit" binary from the tar.gz.
-	gzr, err := gzip.NewReader(resp.Body)
+	// Read entire zip into memory (archive/zip needs random access).
+	zipData, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("gzip: %w", err)
-	}
-	defer gzr.Close()
-
-	tr := tar.NewReader(gzr)
-	var binaryData []byte
-	for {
-		hdr, err := tr.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return fmt.Errorf("tar: %w", err)
-		}
-		if hdr.Name == "drillbit" || strings.HasSuffix(hdr.Name, "/drillbit") {
-			binaryData, err = io.ReadAll(tr)
-			if err != nil {
-				return fmt.Errorf("reading binary: %w", err)
-			}
-			break
-		}
+		return fmt.Errorf("download: %w", err)
 	}
 
-	if binaryData == nil {
-		return fmt.Errorf("binary not found in archive")
+	binaryData, err := extractBinaryFromZip(zipData)
+	if err != nil {
+		return err
 	}
 
-	// Replace current executable via temp file + atomic rename.
+	// Replace current executable.
 	execPath, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("finding executable: %w", err)
 	}
 	execPath = resolveExecPath(execPath)
 
-	tmpPath := execPath + ".update"
-	if err := os.WriteFile(tmpPath, binaryData, 0o755); err != nil {
+	// Write new binary to temp file next to the executable.
+	dir := filepath.Dir(execPath)
+	tmpFile, err := os.CreateTemp(dir, "drillbit-update-*")
+	if err != nil {
+		return fmt.Errorf("creating temp file: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+
+	if _, err := tmpFile.Write(binaryData); err != nil {
+		tmpFile.Close()
+		os.Remove(tmpPath)
 		return fmt.Errorf("writing temp binary: %w", err)
+	}
+	tmpFile.Close()
+
+	if err := os.Chmod(tmpPath, 0o755); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("chmod: %w", err)
+	}
+
+	// Rename-away the running binary (works on Windows), then move new one in.
+	backupPath := execPath + ".bak"
+	os.Remove(backupPath) // clean up any previous backup
+	if err := os.Rename(execPath, backupPath); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("backing up current binary: %w", err)
 	}
 
 	if err := os.Rename(tmpPath, execPath); err != nil {
+		// Restore from backup.
+		os.Rename(backupPath, execPath)
 		os.Remove(tmpPath)
 		return fmt.Errorf("replacing binary: %w", err)
 	}
 
+	// Best-effort cleanup of backup.
+	os.Remove(backupPath)
+
 	return nil
+}
+
+// extractBinaryFromZip finds the drillbit binary inside a zip archive.
+func extractBinaryFromZip(data []byte) ([]byte, error) {
+	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return nil, fmt.Errorf("zip: %w", err)
+	}
+
+	want := binaryName()
+	for _, f := range zr.File {
+		name := filepath.Base(f.Name)
+		if name == want {
+			rc, err := f.Open()
+			if err != nil {
+				return nil, fmt.Errorf("zip open %s: %w", f.Name, err)
+			}
+			defer rc.Close()
+			return io.ReadAll(rc)
+		}
+	}
+
+	return nil, fmt.Errorf("binary %q not found in archive", want)
 }
 
 // resolveExecPath follows symlinks to find the real binary path.
 func resolveExecPath(path string) string {
-	resolved, err := os.Readlink(path)
+	resolved, err := filepath.EvalSymlinks(path)
 	if err != nil {
-		return path // not a symlink
-	}
-	if !strings.HasPrefix(resolved, "/") {
-		dir := path[:strings.LastIndex(path, "/")+1]
-		resolved = dir + resolved
+		return path
 	}
 	return resolved
 }

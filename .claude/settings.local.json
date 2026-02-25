@@ -29,7 +29,13 @@
       "Bash(GOROOT=$HOME/.local/share/mise/installs/go/1.26.0 PATH=\"$GOROOT/bin:$PATH\" go build ./...)",
       "Bash(GOROOT=$HOME/.local/share/mise/installs/go/1.26.0 PATH=\"$GOROOT/bin:$PATH\" go build -o /dev/null /Users/jsc/tun/.)",
       "Bash(curl -s https://api.github.com/repos/jclement/drillbit/releases/latest)",
-      "Bash(curl -s https://api.github.com/repos/jclement/drillbit/releases)"
+      "Bash(curl -s https://api.github.com/repos/jclement/drillbit/releases)",
+      "Bash(find /Users/jsc/tun -type f ! -path \"*/.git/*\" ! -path \"*/node_modules/*\" -exec file {} ;)",
+      "Bash(grep -r \"unsafe\" /Users/jsc/tun/*.go)",
+      "Bash(grep -r \"hardcode\\\\|hardcoded\\\\|SECRET\\\\|PASSWORD\\\\|APIKEY\" /Users/jsc/tun/*.go)",
+      "Bash(grep -r \"TLSClientConfig\\\\|InsecureSkipVerify\" /Users/jsc/tun/*.go)",
+      "Bash(git log --all --grep=\"secret\\\\|password\\\\|token\\\\|api.*key\" --oneline -i)",
+      "Bash(gh api repos/afenav/execute-sync/contents --jq '.[].path')"
     ]
   }
 }
