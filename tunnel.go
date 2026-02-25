@@ -50,7 +50,7 @@ func (tm *TunnelManager) Connect(entry *Entry) tea.Cmd {
 		key := tunnelKey(entry)
 
 		// Resolve container IP via SSH.
-		ip, err := resolveContainerIP(entry.Host, entry.Root, entry.Tenant)
+		ip, err := resolveContainerIP(entry.SSHHost, entry.Root, entry.Tenant)
 		if err != nil {
 			return tunnelErrorMsg{key: key, err: fmt.Errorf("resolve IP: %w", err)}
 		}
@@ -62,7 +62,7 @@ func (tm *TunnelManager) Connect(entry *Entry) tea.Cmd {
 			"-o", "ConnectTimeout=10",
 			"-o", "ServerAliveInterval=30",
 			"-o", "ServerAliveCountMax=3",
-			"-L", forwardSpec, entry.Host)
+			"-L", forwardSpec, entry.SSHHost)
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 		done := make(chan error, 1)
@@ -176,7 +176,7 @@ func killTunnel(tun *Tunnel, timeout time.Duration) {
 }
 
 // resolveContainerIP gets the Docker container IP for the db service.
-func resolveContainerIP(host, root, tenant string) (string, error) {
+func resolveContainerIP(sshHost, root, tenant string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
@@ -184,15 +184,15 @@ func resolveContainerIP(host, root, tenant string) (string, error) {
 		`cd %s/%s && sudo docker compose ps -q db | xargs sudo docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}'`,
 		root, tenant,
 	)
-	cmd := exec.CommandContext(ctx, "ssh", "-o", "ConnectTimeout=10", host, script)
+	cmd := exec.CommandContext(ctx, "ssh", "-o", "ConnectTimeout=10", sshHost, script)
 	out, err := cmd.Output()
 	if err != nil {
-		return "", fmt.Errorf("failed to resolve container IP for %s/%s: %w", host, tenant, err)
+		return "", fmt.Errorf("failed to resolve container IP for %s/%s: %w", sshHost, tenant, err)
 	}
 
 	ip := strings.TrimSpace(string(out))
 	if ip == "" {
-		return "", fmt.Errorf("empty container IP for %s/%s — is the db service running?", host, tenant)
+		return "", fmt.Errorf("empty container IP for %s/%s — is the db service running?", sshHost, tenant)
 	}
 	return ip, nil
 }

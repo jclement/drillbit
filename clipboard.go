@@ -20,7 +20,7 @@ func CopyConnStr(e *Entry) error {
 	if e.Password == "" {
 		return fmt.Errorf("no password found for %s/%s", e.Host, e.Tenant)
 	}
-	connStr := fmt.Sprintf("postgresql://postgres:%s@localhost:%d/%s",
-		url.QueryEscape(e.Password), e.LocalPort, e.Tenant)
+	connStr := fmt.Sprintf("postgresql://%s:%s@localhost:%d/%s",
+		url.QueryEscape(e.DBUser), url.QueryEscape(e.Password), e.LocalPort, e.Database)
 	return clipboard.WriteAll(connStr)
 }

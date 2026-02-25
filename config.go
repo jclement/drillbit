@@ -10,14 +10,31 @@ import (
 
 // Config is the top-level configuration for DrillBit.
 type Config struct {
-	Environments map[string][]HostConfig `json:"-"`
-	Autoconnect  []AutoconnectEntry      `json:"autoconnect"`
+	Environments map[string][]HostConfig  `json:"-"`
+	Autoconnect  []AutoconnectEntry       `json:"autoconnect"`
+	Overrides    map[string]EntryOverride `json:"overrides"`
 }
 
 // HostConfig represents a single SSH host with its settings.
 type HostConfig struct {
 	Host string `json:"host"`
+	User string `json:"user"` // SSH user (optional, uses ssh config default if empty)
 	Root string `json:"root"`
+}
+
+// SSHHost returns "user@host" if user is set, otherwise just "host".
+func (hc HostConfig) SSHHost() string {
+	if hc.User != "" {
+		return hc.User + "@" + hc.Host
+	}
+	return hc.Host
+}
+
+// EntryOverride stores user-edited values for a specific host:tenant.
+type EntryOverride struct {
+	DBUser   string `json:"user,omitempty"`
+	Password string `json:"password,omitempty"`
+	Database string `json:"database,omitempty"`
 }
 
 // AutoconnectEntry is a [host, tenant] pair to auto-connect on startup.
@@ -53,11 +70,11 @@ func ClassifyEnv(name string) EnvType {
 }
 
 func DefaultConfigPath() string {
-	dir, err := os.UserConfigDir()
+	home, err := os.UserHomeDir()
 	if err != nil {
-		dir = filepath.Join(os.Getenv("HOME"), ".config")
+		home = os.Getenv("HOME")
 	}
-	return filepath.Join(dir, "drillbit", "config.json")
+	return filepath.Join(home, ".config", "drillbit", "config.json")
 }
 
 // LoadConfig reads and parses the config file.
@@ -71,6 +88,7 @@ func LoadConfig(path string) (*Config, error) {
 	var raw struct {
 		Environments map[string][]json.RawMessage `json:"environments"`
 		Autoconnect  [][]string                   `json:"autoconnect"`
+		Overrides    map[string]EntryOverride      `json:"overrides"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return nil, fmt.Errorf("parsing config: %w", err)
@@ -82,6 +100,10 @@ func LoadConfig(path string) (*Config, error) {
 
 	cfg := &Config{
 		Environments: make(map[string][]HostConfig),
+		Overrides:    raw.Overrides,
+	}
+	if cfg.Overrides == nil {
+		cfg.Overrides = make(map[string]EntryOverride)
 	}
 
 	// Parse each host entry — can be a string or an object.
@@ -131,6 +153,60 @@ func parseHostConfig(data json.RawMessage) (HostConfig, error) {
 	return hc, nil
 }
 
+// SaveConfig writes the config back to disk as normalized JSON.
+func SaveConfig(cfg *Config, path string) error {
+	type hostJSON struct {
+		Host string `json:"host"`
+		User string `json:"user,omitempty"`
+		Root string `json:"root,omitempty"`
+	}
+	type configJSON struct {
+		Environments map[string][]hostJSON    `json:"environments"`
+		Autoconnect  [][]string               `json:"autoconnect"`
+		Overrides    map[string]EntryOverride `json:"overrides,omitempty"`
+	}
+
+	cj := configJSON{
+		Environments: make(map[string][]hostJSON),
+		Autoconnect:  make([][]string, 0),
+	}
+	for env, hosts := range cfg.Environments {
+		for _, h := range hosts {
+			hj := hostJSON{Host: h.Host, User: h.User}
+			if h.Root != defaultRoot {
+				hj.Root = h.Root
+			}
+			cj.Environments[env] = append(cj.Environments[env], hj)
+		}
+	}
+	for _, ac := range cfg.Autoconnect {
+		cj.Autoconnect = append(cj.Autoconnect, []string{ac.Host, ac.Tenant})
+	}
+	// Only include overrides that have at least one non-empty field.
+	if len(cfg.Overrides) > 0 {
+		cj.Overrides = make(map[string]EntryOverride)
+		for k, v := range cfg.Overrides {
+			if v.DBUser != "" || v.Password != "" || v.Database != "" {
+				cj.Overrides[k] = v
+			}
+		}
+		if len(cj.Overrides) == 0 {
+			cj.Overrides = nil
+		}
+	}
+
+	data, err := json.MarshalIndent(cj, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshaling config: %w", err)
+	}
+
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("creating config directory: %w", err)
+	}
+	return os.WriteFile(path, append(data, '\n'), 0o644)
+}
+
 // ScaffoldConfig creates a documented example config file.
 func ScaffoldConfig(path string) error {
 	dir := filepath.Dir(path)
@@ -141,7 +217,7 @@ func ScaffoldConfig(path string) error {
 	content := `{
   "environments": {
     "prod": [
-      {"host": "prod-server-1", "root": "/docker"},
+      {"host": "prod-server-1", "user": "deploy", "root": "/docker"},
       "prod-server-2"
     ],
     "test": [

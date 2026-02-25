@@ -2,13 +2,14 @@ package main
 
 import (
 	"fmt"
+	"net/url"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
 
 	"charm.land/bubbles/v2/textinput"
 	tea "charm.land/bubbletea/v2"
-	"charm.land/lipgloss/v2"
 	"github.com/sahilm/fuzzy"
 )
 
@@ -19,23 +20,37 @@ const (
 	modeNormal viewMode = iota
 	modeFilter
 	modeHelp
+	modeCopy
+	modeConfirmQuit
+	modeConfig
+	modeEdit // edit selected entry (user, pw, db)
 )
 
 // flashMsg is used to clear the status flash after a delay.
 type flashMsg struct{}
 
+// sqlClientErrorMsg is sent when pgcli/psql exits with an error.
+// Separate from tunnelErrorMsg so the tunnel stays connected.
+type sqlClientErrorMsg struct{ err error }
+
 // Model is the main bubbletea model.
 type Model struct {
-	cfg     *Config
-	entries []Entry
+	cfg        *Config
+	configPath string
+	entries    []Entry
 	// filtered holds indices into entries for the current filter.
 	filtered []int
 	cursor   int
 
-	filter textinput.Model
-	mode   viewMode
+	filterText string
+	mode       viewMode
 
 	tunnels *TunnelManager
+	editor  configEditor
+
+	// Edit mode fields (for editing selected entry's user/pw/db).
+	editFields      [3]textinput.Model
+	editFieldCursor int
 
 	width  int
 	height int
@@ -43,19 +58,28 @@ type Model struct {
 	discovering bool
 	discErrors  []hostError
 
-	flash string // ephemeral status message
+	flash         string // ephemeral status message
+	tagline       string // random tagline picked at startup
+	sqlClient     string // "pgcli", "psql", or "" if neither found
+	pendingLaunch string // tunnel key to auto-launch SQL client once connected
 }
 
-func newModel(cfg *Config) Model {
-	ti := textinput.New()
-	ti.Placeholder = "type to filter..."
-	ti.CharLimit = 64
+func newModel(cfg *Config, configPath string) Model {
+	// Detect SQL client: prefer pgcli, fall back to psql.
+	var sqlClient string
+	if _, err := exec.LookPath("pgcli"); err == nil {
+		sqlClient = "pgcli"
+	} else if _, err := exec.LookPath("psql"); err == nil {
+		sqlClient = "psql"
+	}
 
 	return Model{
-		cfg:     cfg,
-		tunnels: NewTunnelManager(),
-		filter:  ti,
-		mode:    modeNormal,
+		cfg:        cfg,
+		configPath: configPath,
+		tunnels:    NewTunnelManager(),
+		mode:       modeNormal,
+		tagline:    randomTagline(),
+		sqlClient:  sqlClient,
 	}
 }
 
@@ -91,17 +115,45 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case discoverMsg:
 		m.discovering = false
-		m.entries = msg.entries
 		m.discErrors = msg.errors
-		m.resetFilter()
-		// Trigger autoconnect.
-		cmds = append(cmds, m.autoconnect()...)
+
+		// Build a map of existing entry state keyed by host:tenant.
+		existing := make(map[string]*Entry, len(m.entries))
+		for i := range m.entries {
+			existing[tunnelKey(&m.entries[i])] = &m.entries[i]
+		}
+
+		// Merge: carry over status, error, and container IP from active tunnels.
+		for i := range msg.entries {
+			key := tunnelKey(&msg.entries[i])
+			if old, ok := existing[key]; ok {
+				msg.entries[i].Status = old.Status
+				msg.entries[i].Error = old.Error
+				msg.entries[i].ContainerIP = old.ContainerIP
+				msg.entries[i].LocalPort = old.LocalPort // keep the same port
+			}
+		}
+
+		firstRun := len(m.entries) == 0
+		m.entries = msg.entries
+		m.applyOverrides()
+		m.applyFilter()
+
+		// Only autoconnect on the first discovery, not refreshes.
+		if firstRun {
+			cmds = append(cmds, m.autoconnect()...)
+		}
 
 	case tunnelConnectedMsg:
 		if e := m.findEntry(msg.key); e != nil {
 			e.Status = StatusConnected
 			e.Error = ""
 			cmds = append(cmds, m.tunnels.MonitorTunnel(msg.key))
+			// If Enter was pressed on a disconnected entry, auto-launch SQL client now.
+			if m.pendingLaunch == msg.key && m.sqlClient != "" {
+				m.pendingLaunch = ""
+				cmds = append(cmds, m.launchSQLClient(e))
+			}
 		}
 
 	case tunnelErrorMsg:
@@ -109,6 +161,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			e.Status = StatusError
 			e.Error = msg.err.Error()
 		}
+		// Clear pending launch if the tunnel we were waiting for failed.
+		if m.pendingLaunch == msg.key {
+			m.pendingLaunch = ""
+		}
+
+	case sqlClientErrorMsg:
+		// SQL client exited with error — flash it but leave connection intact.
+		m.flash = errorMsgStyle.Render(msg.err.Error())
+		cmds = append(cmds, m.clearFlashAfter(3*time.Second))
 
 	case tunnelDisconnectedMsg:
 		if e := m.findEntry(msg.key); e != nil {
@@ -121,8 +182,35 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyPressMsg:
 		switch m.mode {
+		case modeConfig:
+			done, save, cmd := m.editor.update(msg)
+			if cmd != nil {
+				cmds = append(cmds, cmd)
+			}
+			if done {
+				if save {
+					overrides := m.cfg.Overrides
+					m.cfg = m.editor.toConfig(m.cfg.Autoconnect)
+					m.cfg.Overrides = overrides
+					if err := SaveConfig(m.cfg, m.configPath); err != nil {
+						m.flash = errorMsgStyle.Render(fmt.Sprintf("Save: %v", err))
+					} else {
+						m.flash = flashStyle.Render("Config saved, refreshing...")
+						m.discovering = true
+						cmds = append(cmds, discoverAll(m.cfg))
+					}
+					cmds = append(cmds, m.clearFlashAfter(2*time.Second))
+				}
+				m.mode = modeNormal
+			}
+		case modeEdit:
+			cmds = append(cmds, m.updateEdit(msg)...)
+		case modeConfirmQuit:
+			cmds = append(cmds, m.updateConfirmQuit(msg)...)
 		case modeHelp:
 			cmds = append(cmds, m.updateHelp(msg)...)
+		case modeCopy:
+			cmds = append(cmds, m.updateCopy(msg)...)
 		case modeFilter:
 			cmds = append(cmds, m.updateFilter(msg)...)
 		default:
@@ -137,9 +225,21 @@ func (m *Model) updateNormal(msg tea.KeyPressMsg) []tea.Cmd {
 	var cmds []tea.Cmd
 
 	switch msg.String() {
-	case "q", "ctrl+c":
+	case "ctrl+c":
 		m.tunnels.DisconnectAll()
 		return []tea.Cmd{tea.Quit}
+
+	case "esc":
+		if m.filterText != "" {
+			// First Esc clears any active filter.
+			m.filterText = ""
+			m.applyFilter()
+		} else if m.activeConnectionCount() > 0 {
+			m.mode = modeConfirmQuit
+		} else {
+			m.tunnels.DisconnectAll()
+			return []tea.Cmd{tea.Quit}
+		}
 
 	case "up", "k":
 		if m.cursor > 0 {
@@ -151,7 +251,7 @@ func (m *Model) updateNormal(msg tea.KeyPressMsg) []tea.Cmd {
 			m.cursor++
 		}
 
-	case "c", "enter":
+	case "space":
 		if e := m.selectedEntry(); e != nil {
 			switch e.Status {
 			case StatusReady, StatusError:
@@ -163,61 +263,160 @@ func (m *Model) updateNormal(msg tea.KeyPressMsg) []tea.Cmd {
 			}
 		}
 
-	case "d":
-		if e := m.selectedEntry(); e != nil && e.Status == StatusConnected {
-			e.Status = StatusReady
-			cmds = append(cmds, m.tunnels.Disconnect(e))
-		}
-
-	case "x":
-		if e := m.selectedEntry(); e != nil && e.Status == StatusConnected {
-			cmds = append(cmds, m.launchPgcli(e))
-		}
-
-	case "p":
+	case "enter":
 		if e := m.selectedEntry(); e != nil {
-			if err := CopyPassword(e); err != nil {
-				m.flash = errorMsgStyle.Render(err.Error())
+			// Guard: require user, password, and database to be set.
+			if e.DBUser == "" || e.Password == "" || e.Database == "" {
+				var missing []string
+				if e.DBUser == "" {
+					missing = append(missing, "user")
+				}
+				if e.Password == "" {
+					missing = append(missing, "password")
+				}
+				if e.Database == "" {
+					missing = append(missing, "database")
+				}
+				m.flash = errorMsgStyle.Render(fmt.Sprintf("Missing %s — press c to configure", strings.Join(missing, ", ")))
+				cmds = append(cmds, m.clearFlashAfter(3*time.Second))
+			} else if e.Status == StatusConnected && m.sqlClient != "" {
+				cmds = append(cmds, m.launchSQLClient(e))
+			} else if e.Status == StatusReady || e.Status == StatusError {
+				e.Status = StatusConnecting
+				// If SQL client available, auto-launch once connected.
+				if m.sqlClient != "" {
+					m.pendingLaunch = tunnelKey(e)
+				}
+				cmds = append(cmds, m.tunnels.Connect(e))
+			}
+		}
+
+	case "*":
+		if e := m.selectedEntry(); e != nil {
+			m.toggleAutoconnect(e)
+			if err := SaveConfig(m.cfg, m.configPath); err != nil {
+				m.flash = errorMsgStyle.Render(fmt.Sprintf("Save: %v", err))
+			} else if m.isAutoconnect(e) {
+				m.flash = flashStyle.Render("Autoconnect enabled")
 			} else {
-				m.flash = flashStyle.Render("Password copied!")
+				m.flash = flashStyle.Render("Autoconnect disabled")
 			}
 			cmds = append(cmds, m.clearFlashAfter(2*time.Second))
 		}
 
-	case "C":
-		if e := m.selectedEntry(); e != nil {
-			if e.Status != StatusConnected {
-				m.flash = errorMsgStyle.Render("Connect first to copy connection string")
-			} else if err := CopyConnStr(e); err != nil {
-				m.flash = errorMsgStyle.Render(err.Error())
-			} else {
-				m.flash = flashStyle.Render("Connection string copied!")
-			}
-			cmds = append(cmds, m.clearFlashAfter(2*time.Second))
+	case "y":
+		if m.selectedEntry() != nil {
+			m.mode = modeCopy
 		}
+
+	case "c":
+		if e := m.selectedEntry(); e != nil {
+			m.startEdit(e)
+		}
+
+	case "h":
+		m.editor = newConfigEditor(m.cfg)
+		m.mode = modeConfig
 
 	case "r":
 		m.discovering = true
-		m.entries = nil
-		m.filtered = nil
-		m.cursor = 0
 		cmds = append(cmds, discoverAll(m.cfg))
 
-	case "h", "?":
+	case "?":
 		m.mode = modeHelp
 
 	case "/":
 		m.mode = modeFilter
-		m.filter.Focus()
+	}
+
+	return cmds
+}
+
+// startEdit initializes the edit form for the selected entry.
+func (m *Model) startEdit(e *Entry) {
+	m.editFieldCursor = 0
+
+	m.editFields[0] = textinput.New()
+	m.editFields[0].Placeholder = "postgres"
+	m.editFields[0].CharLimit = 64
+	m.editFields[0].SetValue(e.DBUser)
+
+	m.editFields[1] = textinput.New()
+	m.editFields[1].Placeholder = "(password)"
+	m.editFields[1].CharLimit = 256
+	m.editFields[1].SetValue(e.Password)
+
+	m.editFields[2] = textinput.New()
+	m.editFields[2].Placeholder = e.Tenant
+	m.editFields[2].CharLimit = 128
+	m.editFields[2].SetValue(e.Database)
+
+	m.editFields[0].Focus()
+	m.mode = modeEdit
+}
+
+func (m *Model) updateEdit(msg tea.KeyPressMsg) []tea.Cmd {
+	var cmds []tea.Cmd
+
+	switch msg.String() {
+	case "ctrl+c", "esc":
+		m.editFields[m.editFieldCursor].Blur()
+		m.mode = modeNormal
+
+	case "enter":
+		e := m.selectedEntry()
+		if e == nil {
+			m.mode = modeNormal
+			break
+		}
+
+		user := strings.TrimSpace(m.editFields[0].Value())
+		pw := strings.TrimSpace(m.editFields[1].Value())
+		db := strings.TrimSpace(m.editFields[2].Value())
+
+		if user == "" {
+			user = "postgres"
+		}
+		if db == "" {
+			db = e.Tenant
+		}
+
+		e.DBUser = user
+		e.Password = pw
+		e.Database = db
+
+		// Save override to config.
+		key := tunnelKey(e)
+		m.cfg.Overrides[key] = EntryOverride{
+			DBUser:   user,
+			Password: pw,
+			Database: db,
+		}
+		if err := SaveConfig(m.cfg, m.configPath); err != nil {
+			m.flash = errorMsgStyle.Render(fmt.Sprintf("Save: %v", err))
+		} else {
+			m.flash = flashStyle.Render("Saved")
+		}
+		cmds = append(cmds, m.clearFlashAfter(2*time.Second))
+
+		m.editFields[m.editFieldCursor].Blur()
+		m.mode = modeNormal
+
+	case "tab":
+		m.editFields[m.editFieldCursor].Blur()
+		m.editFieldCursor = (m.editFieldCursor + 1) % 3
+		m.editFields[m.editFieldCursor].Focus()
+
+	case "shift+tab":
+		m.editFields[m.editFieldCursor].Blur()
+		m.editFieldCursor = (m.editFieldCursor + 2) % 3
+		m.editFields[m.editFieldCursor].Focus()
 
 	default:
-		// Any printable character starts filtering (fzf-style).
-		s := msg.String()
-		if len(s) == 1 && s >= " " && s <= "~" {
-			m.mode = modeFilter
-			m.filter.Focus()
-			m.filter.SetValue(s)
-			m.applyFilter()
+		var cmd tea.Cmd
+		m.editFields[m.editFieldCursor], cmd = m.editFields[m.editFieldCursor].Update(msg)
+		if cmd != nil {
+			cmds = append(cmds, cmd)
 		}
 	}
 
@@ -228,39 +427,84 @@ func (m *Model) updateFilter(msg tea.KeyPressMsg) []tea.Cmd {
 	switch msg.String() {
 	case "esc":
 		m.mode = modeNormal
-		m.filter.Blur()
-		m.filter.SetValue("")
+		m.filterText = ""
 		m.resetFilter()
-		return nil
 
 	case "enter":
+		// Accept filter and return to normal mode (filter stays active).
 		m.mode = modeNormal
-		m.filter.Blur()
-		return nil
 
 	case "up", "ctrl+p":
 		if m.cursor > 0 {
 			m.cursor--
 		}
-		return nil
 
 	case "down", "ctrl+n":
 		if m.cursor < len(m.filtered)-1 {
 			m.cursor++
 		}
-		return nil
+
+	case "backspace":
+		if len(m.filterText) > 0 {
+			m.filterText = m.filterText[:len(m.filterText)-1]
+			m.applyFilter()
+		}
 
 	default:
-		var cmd tea.Cmd
-		m.filter, cmd = m.filter.Update(msg)
-		m.applyFilter()
-		return []tea.Cmd{cmd}
+		s := msg.String()
+		if len(s) == 1 && s >= " " && s <= "~" {
+			m.filterText += s
+			m.applyFilter()
+		}
+	}
+
+	return nil
+}
+
+func (m *Model) updateCopy(msg tea.KeyPressMsg) []tea.Cmd {
+	var cmds []tea.Cmd
+	m.mode = modeNormal
+
+	switch msg.String() {
+	case "p":
+		if e := m.selectedEntry(); e != nil {
+			if err := CopyPassword(e); err != nil {
+				m.flash = errorMsgStyle.Render(err.Error())
+			} else {
+				m.flash = flashStyle.Render("Password copied!")
+			}
+			cmds = append(cmds, m.clearFlashAfter(2*time.Second))
+		}
+	case "c":
+		if e := m.selectedEntry(); e != nil {
+			if e.Status != StatusConnected {
+				m.flash = errorMsgStyle.Render("Connect first to copy connection string")
+			} else if err := CopyConnStr(e); err != nil {
+				m.flash = errorMsgStyle.Render(err.Error())
+			} else {
+				m.flash = flashStyle.Render("Connection string copied!")
+			}
+			cmds = append(cmds, m.clearFlashAfter(2*time.Second))
+		}
+	}
+
+	return cmds
+}
+
+func (m *Model) updateConfirmQuit(msg tea.KeyPressMsg) []tea.Cmd {
+	switch msg.String() {
+	case "esc":
+		m.tunnels.DisconnectAll()
+		return []tea.Cmd{tea.Quit}
+	default:
+		m.mode = modeNormal
+		return nil
 	}
 }
 
 func (m *Model) updateHelp(msg tea.KeyPressMsg) []tea.Cmd {
 	switch msg.String() {
-	case "esc", "h", "?", "q":
+	case "esc", "?":
 		m.mode = modeNormal
 	}
 	return nil
@@ -269,8 +513,7 @@ func (m *Model) updateHelp(msg tea.KeyPressMsg) []tea.Cmd {
 // --- Filter logic ---
 
 func (m *Model) applyFilter() {
-	query := m.filter.Value()
-	if query == "" {
+	if m.filterText == "" {
 		m.resetFilter()
 		return
 	}
@@ -281,7 +524,7 @@ func (m *Model) applyFilter() {
 	}
 
 	src := entrySource{entries: m.entries, indices: allIndices}
-	results := fuzzy.FindFrom(query, src)
+	results := fuzzy.FindFrom(m.filterText, src)
 
 	m.filtered = make([]int, len(results))
 	for i, r := range results {
@@ -325,6 +568,35 @@ func (m *Model) findEntry(key string) *Entry {
 	return nil
 }
 
+func (m *Model) activeConnectionCount() int {
+	count := 0
+	for _, e := range m.entries {
+		if e.Status == StatusConnected || e.Status == StatusConnecting {
+			count++
+		}
+	}
+	return count
+}
+
+func (m *Model) isAutoconnect(e *Entry) bool {
+	for _, ac := range m.cfg.Autoconnect {
+		if ac.Host == e.Host && ac.Tenant == e.Tenant {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Model) toggleAutoconnect(e *Entry) {
+	for i, ac := range m.cfg.Autoconnect {
+		if ac.Host == e.Host && ac.Tenant == e.Tenant {
+			m.cfg.Autoconnect = append(m.cfg.Autoconnect[:i], m.cfg.Autoconnect[i+1:]...)
+			return
+		}
+	}
+	m.cfg.Autoconnect = append(m.cfg.Autoconnect, AutoconnectEntry{Host: e.Host, Tenant: e.Tenant})
+}
+
 func (m *Model) autoconnect() []tea.Cmd {
 	var cmds []tea.Cmd
 	for _, ac := range m.cfg.Autoconnect {
@@ -339,13 +611,37 @@ func (m *Model) autoconnect() []tea.Cmd {
 	return cmds
 }
 
-func (m *Model) launchPgcli(e *Entry) tea.Cmd {
-	connStr := fmt.Sprintf("postgresql://postgres:%s@localhost:%d/%s",
-		e.Password, e.LocalPort, e.Tenant)
-	c := exec.Command("pgcli", connStr)
+// applyOverrides merges config overrides into discovered entries.
+func (m *Model) applyOverrides() {
+	if len(m.cfg.Overrides) == 0 {
+		return
+	}
+	for i := range m.entries {
+		key := tunnelKey(&m.entries[i])
+		if ov, ok := m.cfg.Overrides[key]; ok {
+			if ov.DBUser != "" {
+				m.entries[i].DBUser = ov.DBUser
+			}
+			if ov.Password != "" {
+				m.entries[i].Password = ov.Password
+			}
+			if ov.Database != "" {
+				m.entries[i].Database = ov.Database
+			}
+		}
+	}
+}
+
+func (m *Model) launchSQLClient(e *Entry) tea.Cmd {
+	connStr := fmt.Sprintf("postgresql://%s:%s@localhost:%d/%s",
+		url.QueryEscape(e.DBUser), url.QueryEscape(e.Password), e.LocalPort, e.Database)
+	c := exec.Command(m.sqlClient, connStr)
+	c.Stdin = os.Stdin
+	c.Stdout = os.Stdout
+	c.Stderr = os.Stderr
 	return tea.ExecProcess(c, func(err error) tea.Msg {
 		if err != nil {
-			return tunnelErrorMsg{key: tunnelKey(e), err: fmt.Errorf("pgcli: %w", err)}
+			return sqlClientErrorMsg{err: fmt.Errorf("%s: %w", m.sqlClient, err)}
 		}
 		return nil
 	})
@@ -366,6 +662,14 @@ func altView(s string) tea.View {
 }
 
 func (m Model) View() tea.View {
+	// Full-screen overlays.
+	if m.mode == modeHelp {
+		return altView(renderHelp(m.width, m.height, m.sqlClient))
+	}
+	if m.mode == modeConfig {
+		return altView(m.editor.view(m.width))
+	}
+
 	var b strings.Builder
 
 	// Header.
@@ -375,6 +679,7 @@ func (m Model) View() tea.View {
 	if version != "dev" {
 		b.WriteString(dimStyle.Render("  v" + version))
 	}
+	b.WriteString(dimStyle.Render("  " + m.tagline))
 	b.WriteString("\n\n")
 
 	// Discovery errors.
@@ -396,32 +701,99 @@ func (m Model) View() tea.View {
 		return altView(b.String())
 	}
 
+	// Stats line.
+	connected := 0
+	for _, e := range m.entries {
+		if e.Status == StatusConnected {
+			connected++
+		}
+	}
+	stats := dimStyle.Render(fmt.Sprintf("  %d databases", len(m.entries)))
+	if connected > 0 {
+		stats += statusConnected.Render(fmt.Sprintf("  %d connected", connected))
+	}
+	if len(m.filtered) != len(m.entries) {
+		stats += dimStyle.Render(fmt.Sprintf("  (%d shown)", len(m.filtered)))
+	}
+	b.WriteString(stats + "\n\n")
+
 	// Filter bar.
 	if m.mode == modeFilter {
-		b.WriteString("  " + filterLabelStyle.Render("/") + " " + m.filter.View() + "\n\n")
+		filterDisplay := filterLabelStyle.Render("/") + " " + m.filterText + dimStyle.Render("\u258f")
+		b.WriteString("  " + filterDisplay + "\n\n")
+	} else if m.filterText != "" {
+		filterDisplay := filterLabelStyle.Render("/") + " " + m.filterText
+		b.WriteString("  " + filterDisplay + "\n\n")
 	}
 
 	// Table.
 	b.WriteString(m.renderTable())
 	b.WriteString("\n")
 
+	// Edit form (shown inline below table when in edit mode).
+	if m.mode == modeEdit {
+		b.WriteString(m.renderEditForm())
+		b.WriteString("\n")
+	}
+
 	// Flash message.
 	if m.flash != "" {
 		b.WriteString("  " + m.flash + "\n")
 	}
 
-	// Help overlay or help bar.
-	if m.mode == modeHelp {
-		b.WriteString("\n")
-		b.WriteString(renderHelp())
-		b.WriteString("\n")
-	} else {
-		b.WriteString("\n")
+	// Bottom bar: contextual based on mode.
+	b.WriteString("\n")
+	switch m.mode {
+	case modeFilter:
+		b.WriteString(m.renderFilterBar())
+	case modeCopy:
+		b.WriteString(m.renderCopyPrompt())
+	case modeConfirmQuit:
+		b.WriteString(m.renderQuitPrompt())
+	case modeEdit:
+		b.WriteString(m.renderEditBar())
+	default:
 		b.WriteString(m.renderHelpBar())
-		b.WriteString("\n")
 	}
+	b.WriteString("\n")
 
 	return altView(b.String())
+}
+
+// colWidths computes responsive column widths based on terminal width.
+type colWidths struct {
+	env, host, tenant, auto, user, pw, db, port int
+}
+
+func (m Model) calcColumns() colWidths {
+	w := m.width
+	if w < 60 {
+		w = 80
+	}
+	// Fixed columns: env(6) + auto(4) + pw(2) + port(7) + padding/status(~20)
+	fixed := 6 + 4 + 2 + 7 + 20
+	remaining := w - fixed
+	if remaining < 40 {
+		remaining = 40
+	}
+	// Split: host 20%, tenant 30%, user 20%, db 30%
+	hostW := remaining * 20 / 100
+	tenantW := remaining * 30 / 100
+	userW := remaining * 20 / 100
+	dbW := remaining - hostW - tenantW - userW
+	if hostW < 8 {
+		hostW = 8
+	}
+	if tenantW < 8 {
+		tenantW = 8
+	}
+	if userW < 6 {
+		userW = 6
+	}
+	if dbW < 6 {
+		dbW = 6
+	}
+	return colWidths{env: 6, host: hostW, tenant: tenantW, auto: 4, user: userW, pw: 2, db: dbW, port: 7}
 }
 
 // renderTable draws the table with per-row environment coloring.
@@ -430,29 +802,30 @@ func (m Model) renderTable() string {
 		return "  " + dimStyle.Render("No matches.") + "\n"
 	}
 
-	// Column widths.
-	const (
-		colEnv    = 6
-		colHost   = 14
-		colTenant = 22
-		colPort   = 7
-		colStatus = 30
-	)
+	c := m.calcColumns()
 
 	var b strings.Builder
 
 	// Header row.
-	header := fmt.Sprintf("  %-*s  %-*s  %-*s  %-*s  %s",
-		colEnv, "ENV",
-		colHost, "HOST",
-		colTenant, "TENANT",
-		colPort, "PORT",
+	header := fmt.Sprintf("  %-*s %-*s %-*s %-*s %-*s %-*s %-*s %-*s %s",
+		c.env, "ENV",
+		c.host, "HOST",
+		c.tenant, "TENANT",
+		c.auto, "AUTO",
+		c.user, "USER",
+		c.pw, "PW",
+		c.db, "DB",
+		c.port, "PORT",
 		"STATUS",
 	)
 	b.WriteString(colHeaderStyle.Render(header) + "\n")
 
+	// Separator.
+	sep := "  " + strings.Repeat("\u2500", min(m.width-4, len(header)))
+	b.WriteString(dimStyle.Render(sep) + "\n")
+
 	// Determine visible range for scrolling.
-	maxVisible := m.height - 12 // Leave room for header, help, etc.
+	maxVisible := m.height - 14
 	if maxVisible < 5 {
 		maxVisible = 5
 	}
@@ -474,26 +847,77 @@ func (m Model) renderTable() string {
 		env := strings.ToUpper(e.Env)
 		status := styledStatus(e.Status, e.Error)
 
-		row := fmt.Sprintf("  %-*s  %-*s  %-*s  %-*d",
-			colEnv, env,
-			colHost, e.Host,
-			colTenant, e.Tenant,
-			colPort, e.LocalPort,
+		auto := " "
+		if m.isAutoconnect(&e) {
+			auto = "*"
+		}
+
+		pw := "-"
+		if e.Password != "" {
+			pw = "\u2022"
+		}
+
+		// Truncate fields that are too long.
+		host := truncate(e.Host, c.host)
+		tenant := truncate(e.Tenant, c.tenant)
+		user := truncate(e.DBUser, c.user)
+		db := truncate(e.Database, c.db)
+
+		row := fmt.Sprintf("  %-*s %-*s %-*s %-*s %-*s %-*s %-*s %-*d",
+			c.env, env,
+			c.host, host,
+			c.tenant, tenant,
+			c.auto, auto,
+			c.user, user,
+			c.pw, pw,
+			c.db, db,
+			c.port, e.LocalPort,
 		)
 
 		if isSelected {
-			// Render the row content with selection highlight, status appended.
-			b.WriteString(selectedStyle.Render(row) + "  " + status + "\n")
+			b.WriteString(selectedStyle.Render(row) + " " + status + "\n")
 		} else {
 			style := envRowStyle(e.Env)
-			b.WriteString(style.Render(row) + "  " + status + "\n")
+			b.WriteString(style.Render(row) + " " + status + "\n")
 		}
 	}
 
 	// Scroll indicator.
 	if len(m.filtered) > maxVisible {
 		total := len(m.filtered)
-		b.WriteString(dimStyle.Render(fmt.Sprintf("  ... %d / %d shown", end-start, total)) + "\n")
+		b.WriteString(dimStyle.Render(fmt.Sprintf("  \u2191\u2193 %d / %d", end-start, total)) + "\n")
+	}
+
+	return b.String()
+}
+
+func truncate(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	if maxLen <= 3 {
+		return s[:maxLen]
+	}
+	return s[:maxLen-1] + "\u2026"
+}
+
+// renderEditForm renders the inline edit form for the selected entry.
+func (m Model) renderEditForm() string {
+	e := m.selectedEntry()
+	if e == nil {
+		return ""
+	}
+
+	var b strings.Builder
+	b.WriteString("  " + headerAccent.Render(fmt.Sprintf("Configure %s/%s", e.Host, e.Tenant)) + "\n\n")
+
+	labels := [3]string{"  User:      ", "  Password:  ", "  Database:  "}
+	for i, label := range labels {
+		if i == m.editFieldCursor {
+			b.WriteString(helpKeyStyle.Render("> ") + dimStyle.Render(label[2:]) + m.editFields[i].View() + "\n")
+		} else {
+			b.WriteString(dimStyle.Render(label) + m.editFields[i].View() + "\n")
+		}
 	}
 
 	return b.String()
@@ -502,20 +926,64 @@ func (m Model) renderTable() string {
 // renderHelpBar renders the compact keybinding bar at the bottom.
 func (m Model) renderHelpBar() string {
 	keys := []struct{ key, desc string }{
-		{"c", "connect"},
-		{"d", "disconnect"},
-		{"x", "pgcli"},
-		{"p", "password"},
-		{"C", "connstr"},
-		{"/", "filter"},
-		{"r", "refresh"},
-		{"h", "help"},
-		{"q", "quit"},
+		{"Space", "toggle"},
 	}
+	if m.sqlClient != "" {
+		keys = append(keys, struct{ key, desc string }{"\u23ce", m.sqlClient})
+	}
+	keys = append(keys, []struct{ key, desc string }{
+		{"*", "auto"},
+		{"c", "configure"},
+		{"y", "copy"},
+		{"/", "filter"},
+		{"h", "hosts"},
+		{"r", "refresh"},
+		{"?", "help"},
+		{"Esc", "quit"},
+	}...)
 
 	var parts []string
 	for _, k := range keys {
 		parts = append(parts, helpKeyStyle.Render(k.key)+helpBarStyle.Render(":"+k.desc))
 	}
-	return "  " + lipgloss.JoinHorizontal(lipgloss.Top, strings.Join(parts, "  "))
+	return "  " + strings.Join(parts, "  ")
+}
+
+// renderFilterBar renders the filter mode help bar.
+func (m Model) renderFilterBar() string {
+	return "  " +
+		dimStyle.Render("Type to filter") + "  " +
+		helpKeyStyle.Render("Enter") + helpBarStyle.Render(":accept") + "  " +
+		helpKeyStyle.Render("Esc") + helpBarStyle.Render(":clear")
+}
+
+// renderCopyPrompt renders the copy mode prompt in the help bar area.
+func (m Model) renderCopyPrompt() string {
+	return "  " +
+		helpKeyStyle.Render("Copy: ") +
+		helpKeyStyle.Render("p") + helpBarStyle.Render(":password") + "  " +
+		helpKeyStyle.Render("c") + helpBarStyle.Render(":connstr") + "  " +
+		dimStyle.Render("Esc:cancel")
+}
+
+// renderEditBar renders the edit mode help bar.
+func (m Model) renderEditBar() string {
+	return "  " +
+		helpKeyStyle.Render("Tab") + helpBarStyle.Render(":next field") + "  " +
+		helpKeyStyle.Render("Enter") + helpBarStyle.Render(":save") + "  " +
+		helpKeyStyle.Render("Esc") + helpBarStyle.Render(":cancel")
+}
+
+// renderQuitPrompt renders the quit confirmation in the help bar area.
+func (m Model) renderQuitPrompt() string {
+	count := m.activeConnectionCount()
+	msg := fmt.Sprintf("Quit? %d active connection", count)
+	if count != 1 {
+		msg += "s"
+	}
+	msg += " will close. "
+	return "  " +
+		statusConnecting.Render(msg) +
+		helpKeyStyle.Render("Esc") + helpBarStyle.Render(":confirm") + "  " +
+		dimStyle.Render("any other key:cancel")
 }

@@ -22,7 +22,10 @@
       "Bash(GOROOT=/Users/jsc/.local/share/mise/installs/go/1.26.0 go doc charm.land/bubbletea/v2 View.AltScreen)",
       "Bash(/Users/jsc/tun/bin/drillbit --version)",
       "Bash(/Users/jsc/tun/bin/drillbit --help)",
-      "Bash(GOROOT=/Users/jsc/.local/share/mise/installs/go/1.26.0 go vet ./...)"
+      "Bash(GOROOT=/Users/jsc/.local/share/mise/installs/go/1.26.0 go vet ./...)",
+      "Bash(go build ./...)",
+      "Bash(ls -la /Users/jsc/go/pkg/mod/charm.land/bubbletea*/)",
+      "Bash(GOROOT=/Users/jsc/.local/share/mise/installs/go/1.26.0 /Users/jsc/.local/share/mise/installs/go/1.26.0/bin/go build ./...)"
     ]
   }
 }

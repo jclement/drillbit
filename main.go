@@ -3,21 +3,29 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/exec"
 
 	tea "charm.land/bubbletea/v2"
 )
 
-// version is set at build time via -ldflags.
-var version = "dev"
+// Build info, set at build time via -ldflags.
+var (
+	version   = "dev"
+	commit    = "none"
+	buildDate = "unknown"
+)
 
 func main() {
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
 		case "--version", "-v":
-			fmt.Printf("drillbit %s\n", version)
+			fmt.Printf("drillbit %s (commit: %s, built: %s)\n", version, commit, buildDate)
 			os.Exit(0)
 		case "--help":
 			printUsage()
+			os.Exit(0)
+		case "-e", "--edit":
+			openConfigInEditor(DefaultConfigPath())
 			os.Exit(0)
 		}
 	}
@@ -52,7 +60,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	m := newModel(cfg)
+	m := newModel(cfg, configPath)
 	m.discovering = true
 
 	p := tea.NewProgram(m)
@@ -62,11 +70,39 @@ func main() {
 	}
 }
 
+func openConfigInEditor(path string) {
+	editor := os.Getenv("EDITOR")
+	if editor == "" {
+		editor = os.Getenv("VISUAL")
+	}
+	if editor == "" {
+		editor = "vi"
+	}
+
+	// Scaffold config if it doesn't exist yet.
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		if err := ScaffoldConfig(path); err != nil {
+			fmt.Fprintf(os.Stderr, "Error creating config: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
+	cmd := exec.Command(editor, path)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error opening editor: %v\n", err)
+		os.Exit(1)
+	}
+}
+
 func printUsage() {
 	fmt.Println("Usage: drillbit [options]")
 	fmt.Println()
 	fmt.Println("Options:")
 	fmt.Println("  -c, --config <path>   Config file (default: ~/.config/drillbit/config.json)")
+	fmt.Println("  -e, --edit            Open config in $EDITOR")
 	fmt.Println("  -v, --version         Show version")
 	fmt.Println("      --help            Show this help")
 }

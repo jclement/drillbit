@@ -1,4 +1,0 @@
-FROM alpine:3.21
-RUN apk add --no-cache openssh-client pgcli
-COPY drillbit /usr/local/bin/drillbit
-ENTRYPOINT ["drillbit"]

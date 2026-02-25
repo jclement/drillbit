@@ -88,7 +88,7 @@ var (
 				Border(lipgloss.RoundedBorder()).
 				BorderForeground(lipgloss.Color("#e94560")).
 				Padding(1, 2).
-				Width(52)
+				Width(64)
 
 	helpTitleStyle = lipgloss.NewStyle().
 			Bold(true).
