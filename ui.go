@@ -987,6 +987,11 @@ func (m Model) buildMainView() string {
 	b.WriteString(m.renderTable())
 	b.WriteString("\n")
 
+	// Show full error for selected entry.
+	if e := m.selectedEntry(); e != nil && e.Status == StatusError && e.Error != "" {
+		b.WriteString("  " + errorMsgStyle.Render("\u2716 "+e.Error) + "\n\n")
+	}
+
 	// Edit form (shown inline below table when in edit mode).
 	if m.mode == modeEdit {
 		b.WriteString(m.renderEditForm())
@@ -1126,7 +1131,7 @@ func (m Model) renderTable() string {
 		isSelected := i == m.cursor
 
 		env := strings.ToUpper(e.Env)
-		status := styledStatus(e.Status, e.Error)
+		status := styledStatus(e.Status)
 
 		auto := " "
 		if m.isAutoconnect(&e) {

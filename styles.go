@@ -113,8 +113,8 @@ func envRowStyle(env string) lipgloss.Style {
 	}
 }
 
-// statusStyle returns the styled status string.
-func styledStatus(s Status, errMsg string) string {
+// styledStatus returns the styled status string.
+func styledStatus(s Status) string {
 	switch s {
 	case StatusReady:
 		return statusReady.Render("\u25cb Ready")
@@ -123,15 +123,7 @@ func styledStatus(s Status, errMsg string) string {
 	case StatusConnected:
 		return statusConnected.Render("\u25cf Connected")
 	case StatusError:
-		msg := "\u2716 Error"
-		if errMsg != "" {
-			// Truncate long error messages.
-			if len(errMsg) > 30 {
-				errMsg = errMsg[:27] + "..."
-			}
-			msg += ": " + errMsg
-		}
-		return statusError.Render(msg)
+		return statusError.Render("\u2716 Error")
 	default:
 		return "?"
 	}

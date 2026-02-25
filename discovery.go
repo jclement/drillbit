@@ -1,9 +1,7 @@
 package main
 
 import (
-	"context"
 	"fmt"
-	"os/exec"
 	"strings"
 	"sync"
 	"time"
@@ -124,13 +122,16 @@ type tenantInfo struct {
 	database string
 }
 
-// discoverHost enumerates tenant directories on a single host.
+// discoverHost enumerates tenant directories on a single host via native SSH.
 // Only returns tenants where the db container is currently running.
 func discoverHost(host, root string) ([]tenantInfo, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+	client, err := dialSSH(host)
+	if err != nil {
+		return nil, fmt.Errorf("ssh to %s: %w", host, err)
+	}
+	defer client.Close()
 
-	// Single SSH command that:
+	// Single remote command that:
 	// 1. Finds dirs with a compose file containing a db service
 	// 2. Checks the db container is actually running
 	// 3. Extracts POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB from .env and compose
@@ -174,14 +175,38 @@ for dir in %s/*/; do
 
     echo "$name|$user|$pw|$dbname"
 done
-`, root)
+`, shellQuote(root))
 
-	cmd := exec.CommandContext(ctx, "ssh", "-o", "ConnectTimeout=10", host, "bash", "-c", script)
-	out, err := cmd.Output()
+	session, err := client.NewSession()
 	if err != nil {
-		return nil, fmt.Errorf("ssh to %s: %w", host, err)
+		return nil, fmt.Errorf("session: %w", err)
 	}
+	defer session.Close()
 
+	// Run with a timeout to avoid hanging on unresponsive hosts.
+	type result struct {
+		out []byte
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		out, err := session.Output(script)
+		ch <- result{out, err}
+	}()
+
+	select {
+	case r := <-ch:
+		if r.err != nil {
+			return nil, fmt.Errorf("discover %s: %w", host, r.err)
+		}
+		return parseTenants(r.out), nil
+	case <-time.After(30 * time.Second):
+		session.Close()
+		return nil, fmt.Errorf("timeout discovering %s", host)
+	}
+}
+
+func parseTenants(out []byte) []tenantInfo {
 	var tenants []tenantInfo
 	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 		line = strings.TrimSpace(line)
@@ -201,5 +226,5 @@ done
 		}
 		tenants = append(tenants, t)
 	}
-	return tenants, nil
+	return tenants
 }
