@@ -6,28 +6,29 @@ import (
 	"net"
 	"strings"
 	"sync"
-	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"golang.org/x/crypto/ssh"
 )
 
-// TunnelManager tracks all active SSH tunnels.
+// TunnelManager tracks all active SSH tunnels and shares connections per host.
 type TunnelManager struct {
 	mu      sync.Mutex
 	tunnels map[string]*Tunnel
+	pool    *sshPool
 }
 
-// Tunnel represents a native SSH tunnel with local port forwarding.
+// Tunnel represents a single port-forward over a shared SSH connection.
 type Tunnel struct {
-	client   *ssh.Client
-	listener net.Listener
+	sshHost  string       // pool key for Release
+	listener net.Listener // local TCP listener
 	done     chan struct{} // closed when the accept loop exits
 }
 
 func NewTunnelManager() *TunnelManager {
 	return &TunnelManager{
 		tunnels: make(map[string]*Tunnel),
+		pool:    newSSHPool(),
 	}
 }
 
@@ -44,34 +45,35 @@ type tunnelErrorMsg struct {
 }
 type tunnelDisconnectedMsg struct{ key string }
 
-// Connect establishes a native SSH tunnel for the given entry.
+// Connect establishes a port-forward for the given entry, reusing an
+// existing SSH connection to the host if one is already open.
 func (tm *TunnelManager) Connect(entry *Entry) tea.Cmd {
 	return func() tea.Msg {
 		key := tunnelKey(entry)
 
-		// Establish SSH connection.
-		client, err := dialSSH(entry.SSHHost)
+		// Acquire a shared SSH connection for this host.
+		client, err := tm.pool.Acquire(entry.SSHHost)
 		if err != nil {
 			return tunnelErrorMsg{key: key, err: fmt.Errorf("ssh: %w", err)}
 		}
 
-		// Resolve container IP via the SSH connection.
+		// Resolve container IP via the shared connection.
 		ip, err := resolveContainerIP(client, entry.Root, entry.Tenant)
 		if err != nil {
-			client.Close()
+			tm.pool.Release(entry.SSHHost)
 			return tunnelErrorMsg{key: key, err: fmt.Errorf("resolve IP: %w", err)}
 		}
 
 		// Start local listener for port forwarding.
 		listener, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", entry.LocalPort))
 		if err != nil {
-			client.Close()
+			tm.pool.Release(entry.SSHHost)
 			return tunnelErrorMsg{key: key, err: fmt.Errorf("listen :%d: %w", entry.LocalPort, err)}
 		}
 
 		remoteAddr := net.JoinHostPort(ip, "5432")
 		done := make(chan struct{})
-		tun := &Tunnel{client: client, listener: listener, done: done}
+		tun := &Tunnel{sshHost: entry.SSHHost, listener: listener, done: done}
 
 		// Accept loop: forward local connections through SSH to the remote db.
 		go func() {
@@ -101,7 +103,7 @@ func (tm *TunnelManager) Connect(entry *Entry) tea.Cmd {
 	}
 }
 
-// Disconnect tears down a tunnel.
+// Disconnect tears down a single tunnel and releases its pool reference.
 func (tm *TunnelManager) Disconnect(entry *Entry) tea.Cmd {
 	return func() tea.Msg {
 		key := tunnelKey(entry)
@@ -113,13 +115,16 @@ func (tm *TunnelManager) Disconnect(entry *Entry) tea.Cmd {
 		tm.mu.Unlock()
 
 		if ok {
-			closeTunnel(tun)
+			tun.listener.Close()
+			<-tun.done
+			tm.pool.Release(tun.sshHost)
 		}
 		return tunnelDisconnectedMsg{key: key}
 	}
 }
 
-// MonitorTunnel watches for unexpected SSH connection death.
+// MonitorTunnel watches for unexpected tunnel death — either the accept
+// loop failing or the underlying SSH connection dropping.
 func (tm *TunnelManager) MonitorTunnel(key string) tea.Cmd {
 	return func() tea.Msg {
 		tm.mu.Lock()
@@ -129,8 +134,17 @@ func (tm *TunnelManager) MonitorTunnel(key string) tea.Cmd {
 			return nil
 		}
 
-		// Block until the SSH connection closes.
-		tun.client.Wait()
+		dead := tm.pool.Dead(tun.sshHost)
+
+		// Wait for either the accept loop to exit or the SSH connection to die.
+		select {
+		case <-tun.done:
+			// Accept loop exited (forward failure or listener closed).
+		case <-dead:
+			// SSH connection died — close listener to unblock the accept loop.
+			tun.listener.Close()
+			<-tun.done
+		}
 
 		tm.mu.Lock()
 		_, stillTracked := tm.tunnels[key]
@@ -142,10 +156,7 @@ func (tm *TunnelManager) MonitorTunnel(key string) tea.Cmd {
 			return nil
 		}
 
-		// Unexpected death — clean up the listener.
-		tun.listener.Close()
-		<-tun.done
-
+		tm.pool.Release(tun.sshHost)
 		return tunnelErrorMsg{key: key, err: fmt.Errorf("SSH connection lost")}
 	}
 }
@@ -158,7 +169,7 @@ func (tm *TunnelManager) IsAlive(key string) bool {
 	return ok
 }
 
-// DisconnectAll tears down all active tunnels.
+// DisconnectAll tears down all active tunnels (used during shutdown).
 func (tm *TunnelManager) DisconnectAll() {
 	tm.mu.Lock()
 	tunnels := make(map[string]*Tunnel, len(tm.tunnels))
@@ -168,23 +179,18 @@ func (tm *TunnelManager) DisconnectAll() {
 	tm.tunnels = make(map[string]*Tunnel)
 	tm.mu.Unlock()
 
-	var wg sync.WaitGroup
+	// Close all listeners to unblock accept loops.
 	for _, tun := range tunnels {
-		wg.Add(1)
-		go func(t *Tunnel) {
-			defer wg.Done()
-			closeTunnel(t)
-		}(tun)
+		tun.listener.Close()
 	}
-	wg.Wait()
-}
 
-// closeTunnel shuts down a tunnel's listener and SSH client, then waits
-// for the accept loop to exit.
-func closeTunnel(tun *Tunnel) {
-	tun.listener.Close()
-	tun.client.Close()
-	<-tun.done
+	// Wait for all accept loops to finish.
+	for _, tun := range tunnels {
+		<-tun.done
+	}
+
+	// Force-close all SSH connections.
+	tm.pool.CloseAll()
 }
 
 // forward copies data bidirectionally between two connections.
@@ -223,32 +229,4 @@ func resolveContainerIP(client *ssh.Client, root, tenant string) (string, error)
 		ip = ip[:idx]
 	}
 	return ip, nil
-}
-
-// resolveContainerIPFresh dials a new SSH connection to resolve the container IP.
-// Used during discovery when no persistent connection exists.
-func resolveContainerIPFresh(sshHost, root, tenant string) (string, error) {
-	client, err := dialSSH(sshHost)
-	if err != nil {
-		return "", err
-	}
-	defer client.Close()
-	return resolveContainerIP(client, root, tenant)
-}
-
-// keepAlive sends periodic keepalive requests to detect dead connections.
-func keepAlive(client *ssh.Client, interval time.Duration, stop <-chan struct{}) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-stop:
-			return
-		case <-ticker.C:
-			_, _, err := client.SendRequest("keepalive@openssh.com", true, nil)
-			if err != nil {
-				return
-			}
-		}
-	}
 }

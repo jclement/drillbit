@@ -7,12 +7,137 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	sshconfig "github.com/kevinburke/ssh_config"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 )
+
+// sshPool manages shared SSH connections, one per host.
+type sshPool struct {
+	mu    sync.Mutex
+	conns map[string]*pooledConn
+}
+
+type pooledConn struct {
+	client *ssh.Client
+	refs   int
+	dead   chan struct{} // closed when the connection dies
+}
+
+func newSSHPool() *sshPool {
+	return &sshPool{conns: make(map[string]*pooledConn)}
+}
+
+// Acquire returns a shared SSH client for the host, dialing a new connection
+// if one doesn't exist or the existing one is dead. Caller must Release when done.
+func (p *sshPool) Acquire(sshHost string) (*ssh.Client, error) {
+	p.mu.Lock()
+	if pc, ok := p.conns[sshHost]; ok {
+		select {
+		case <-pc.dead:
+			// Connection is dead, will dial a new one below.
+			delete(p.conns, sshHost)
+		default:
+			pc.refs++
+			p.mu.Unlock()
+			return pc.client, nil
+		}
+	}
+	p.mu.Unlock()
+
+	// Dial without holding the lock (may take seconds).
+	client, err := dialSSH(sshHost)
+	if err != nil {
+		return nil, err
+	}
+
+	dead := make(chan struct{})
+	go func() {
+		client.Wait()
+		close(dead)
+	}()
+	go keepAlive(client, 30*time.Second, dead)
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	// Another goroutine may have raced us and already connected.
+	if pc, ok := p.conns[sshHost]; ok {
+		select {
+		case <-pc.dead:
+			// Still dead, replace with ours.
+		default:
+			// They won the race — use theirs, discard ours.
+			pc.refs++
+			client.Close()
+			return pc.client, nil
+		}
+	}
+
+	p.conns[sshHost] = &pooledConn{client: client, refs: 1, dead: dead}
+	return client, nil
+}
+
+// Release decrements the reference count for a host's connection.
+// When refs reach zero the SSH connection is closed.
+func (p *sshPool) Release(sshHost string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	pc, ok := p.conns[sshHost]
+	if !ok {
+		return
+	}
+	pc.refs--
+	if pc.refs <= 0 {
+		pc.client.Close()
+		delete(p.conns, sshHost)
+	}
+}
+
+// Dead returns a channel that is closed when the host's SSH connection dies.
+// If no connection exists, returns an already-closed channel.
+func (p *sshPool) Dead(sshHost string) <-chan struct{} {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if pc, ok := p.conns[sshHost]; ok {
+		return pc.dead
+	}
+	ch := make(chan struct{})
+	close(ch)
+	return ch
+}
+
+// CloseAll forcibly closes every pooled connection (used during shutdown).
+func (p *sshPool) CloseAll() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for host, pc := range p.conns {
+		pc.client.Close()
+		delete(p.conns, host)
+	}
+}
+
+// keepAlive sends periodic keepalive requests to detect dead connections.
+func keepAlive(client *ssh.Client, interval time.Duration, stop <-chan struct{}) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			_, _, err := client.SendRequest("keepalive@openssh.com", true, nil)
+			if err != nil {
+				return
+			}
+		}
+	}
+}
+
+// --- SSH dial and helpers ---
 
 // dialSSH establishes an SSH connection to the given host.
 // sshHost can be "user@host" or just "host". SSH config (~/.ssh/config)
