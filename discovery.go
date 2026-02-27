@@ -153,6 +153,23 @@ for dir in %s/*/; do
     running=$(sudo docker inspect -f '{{.State.Running}}' "$cid" 2>/dev/null)
     [ "$running" != "true" ] && continue
 
+    # resolve_var: if a value looks like ${VAR} or $VAR, look it up in .env
+    resolve_var() {
+        local val="$1" envfile="$2"
+        # Strip ${...} or $... wrapper to get the variable name
+        local varname=""
+        case "$val" in
+            \$\{*\}) varname="${val#\$\{}" ; varname="${varname%\}}" ;;
+            \$*)     varname="${val#\$}" ;;
+        esac
+        if [ -n "$varname" ] && [ -f "$envfile" ]; then
+            local resolved
+            resolved=$(grep -oP "^${varname}=\K.*" "$envfile" 2>/dev/null || true)
+            [ -n "$resolved" ] && val="$resolved"
+        fi
+        printf '%%s' "$val"
+    }
+
     # Extract credentials: check .env first, then compose environment section
     pw=""
     user=""
@@ -172,6 +189,11 @@ for dir in %s/*/; do
     if [ -z "$dbname" ]; then
         dbname=$(grep -oP 'POSTGRES_DB[=:]\s*\K\S+' "$compose" 2>/dev/null | head -1 || true)
     fi
+
+    # Resolve any ${VAR} or $VAR references against the .env file
+    pw=$(resolve_var "$pw" "$dir/.env")
+    user=$(resolve_var "$user" "$dir/.env")
+    dbname=$(resolve_var "$dbname" "$dir/.env")
 
     echo "$name|$user|$pw|$dbname"
 done
