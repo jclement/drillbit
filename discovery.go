@@ -159,7 +159,7 @@ for dir in %s/*/; do
         # Strip ${...} or $... wrapper to get the variable name
         local varname=""
         case "$val" in
-            \$\{*\}) varname="${val#\$\{}" ; varname="${varname%\}}" ;;
+            \$\{*\}) varname="${val#\$\{}" ; varname="${varname%%\}}" ;;
             \$*)     varname="${val#\$}" ;;
         esac
         if [ -n "$varname" ] && [ -f "$envfile" ]; then

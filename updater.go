@@ -5,6 +5,8 @@ import (
 	"archive/zip"
 	"bytes"
 	"compress/gzip"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -16,6 +18,10 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/sigstore/sigstore-go/pkg/bundle"
+	"github.com/sigstore/sigstore-go/pkg/root"
+	"github.com/sigstore/sigstore-go/pkg/tuf"
+	"github.com/sigstore/sigstore-go/pkg/verify"
 )
 
 const (
@@ -27,11 +33,13 @@ const (
 
 // updateInfo holds information about an available update.
 type updateInfo struct {
-	Version   string // e.g. "1.2.3" (no "v" prefix)
-	TagName   string // e.g. "v1.2.3"
-	HTMLURL   string // GitHub release page URL
-	AssetURL  string // direct download URL for the correct archive
-	AssetName string // e.g. "drillbit_1.2.3_darwin_arm64.zip"
+	Version      string // e.g. "1.2.3" (no "v" prefix)
+	TagName      string // e.g. "v1.2.3"
+	HTMLURL      string // GitHub release page URL
+	AssetURL     string // direct download URL for the correct archive
+	AssetName    string // e.g. "drillbit_1.2.3_darwin_arm64.zip"
+	ChecksumURL  string // URL to checksums.txt
+	BundleURL    string // URL to checksums.txt.sigstore.json
 }
 
 // --- Bubbletea messages ---
@@ -119,12 +127,16 @@ func fetchLatestRelease() (*updateInfo, error) {
 	wantName := fmt.Sprintf("drillbit_%s_%s_%s.%s",
 		ver, runtime.GOOS, runtime.GOARCH, ext)
 
-	var assetURL, assetName string
+	var assetURL, assetName, checksumURL, bundleURL string
 	for _, a := range rel.Assets {
-		if a.Name == wantName {
+		switch {
+		case a.Name == wantName:
 			assetURL = a.BrowserDownloadURL
 			assetName = a.Name
-			break
+		case a.Name == "checksums.txt":
+			checksumURL = a.BrowserDownloadURL
+		case a.Name == "checksums.txt.sigstore.json":
+			bundleURL = a.BrowserDownloadURL
 		}
 	}
 
@@ -133,11 +145,13 @@ func fetchLatestRelease() (*updateInfo, error) {
 	}
 
 	return &updateInfo{
-		Version:   ver,
-		TagName:   rel.TagName,
-		HTMLURL:   rel.HTMLURL,
-		AssetURL:  assetURL,
-		AssetName: assetName,
+		Version:     ver,
+		TagName:     rel.TagName,
+		HTMLURL:     rel.HTMLURL,
+		AssetURL:    assetURL,
+		AssetName:   assetName,
+		ChecksumURL: checksumURL,
+		BundleURL:   bundleURL,
 	}, nil
 }
 
@@ -153,23 +167,49 @@ func performUpdate(info updateInfo) tea.Cmd {
 
 func doUpdate(info updateInfo) error {
 	client := &http.Client{Timeout: downloadTimeout}
-	resp, err := client.Get(info.AssetURL)
+
+	// Verify the release signature if a sigstore bundle is available.
+	if info.BundleURL != "" && info.ChecksumURL != "" {
+		checksumData, err := httpGet(client, info.ChecksumURL)
+		if err != nil {
+			return fmt.Errorf("downloading checksums: %w", err)
+		}
+		bundleData, err := httpGet(client, info.BundleURL)
+		if err != nil {
+			return fmt.Errorf("downloading signature bundle: %w", err)
+		}
+		if err := verifySigstoreBundle(checksumData, bundleData); err != nil {
+			return fmt.Errorf("signature verification: %w", err)
+		}
+
+		// Download the archive and verify its checksum.
+		archiveData, err := httpGet(client, info.AssetURL)
+		if err != nil {
+			return fmt.Errorf("download: %w", err)
+		}
+		expectedHash, err := findChecksumForAsset(checksumData, info.AssetName)
+		if err != nil {
+			return err
+		}
+		if err := verifyChecksum(archiveData, expectedHash); err != nil {
+			return fmt.Errorf("archive integrity: %w", err)
+		}
+		return installBinary(archiveData, info.AssetName)
+	}
+
+	// Fallback for pre-signing releases: no verification.
+	archiveData, err := httpGet(client, info.AssetURL)
 	if err != nil {
 		return fmt.Errorf("download: %w", err)
 	}
-	defer resp.Body.Close()
+	return installBinary(archiveData, info.AssetName)
+}
 
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("download: HTTP %s", resp.Status)
-	}
-
-	archiveData, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("download: %w", err)
-	}
-
+// installBinary extracts the binary from the archive and replaces the current executable.
+func installBinary(archiveData []byte, assetName string) error {
 	var binaryData []byte
-	if strings.HasSuffix(info.AssetName, ".zip") {
+	var err error
+	if strings.HasSuffix(assetName, ".zip") {
 		binaryData, err = extractBinaryFromZip(archiveData)
 	} else {
 		binaryData, err = extractBinaryFromTarGz(archiveData)
@@ -306,4 +346,85 @@ func parseSemver(s string) [3]int {
 	var parts [3]int
 	fmt.Sscanf(s, "%d.%d.%d", &parts[0], &parts[1], &parts[2])
 	return parts
+}
+
+// httpGet downloads a URL and returns the response body.
+func httpGet(client *http.Client, url string) ([]byte, error) {
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %s", resp.Status)
+	}
+	return io.ReadAll(resp.Body)
+}
+
+// verifySigstoreBundle verifies that checksumData was signed by our GitHub Actions
+// workflow using Sigstore keyless signing.
+func verifySigstoreBundle(checksumData, bundleJSON []byte) error {
+	// Load the Sigstore public good trusted root (Fulcio CA + Rekor log).
+	trustedRoot, err := root.NewLiveTrustedRoot(tuf.DefaultOptions())
+	if err != nil {
+		return fmt.Errorf("loading trusted root: %w", err)
+	}
+
+	// Parse the sigstore bundle.
+	var b bundle.Bundle
+	if err := b.UnmarshalJSON(bundleJSON); err != nil {
+		return fmt.Errorf("parsing bundle: %w", err)
+	}
+
+	// Create a verifier requiring SCTs and transparency log entries.
+	verifier, err := verify.NewVerifier(trustedRoot,
+		verify.WithSignedCertificateTimestamps(1),
+		verify.WithTransparencyLog(1),
+		verify.WithObserverTimestamps(1),
+	)
+	if err != nil {
+		return fmt.Errorf("creating verifier: %w", err)
+	}
+
+	// Require that the signing certificate was issued to our GitHub Actions workflow.
+	certID, err := verify.NewShortCertificateIdentity(
+		"https://token.actions.githubusercontent.com", "",
+		"", "^https://github.com/jclement/drillbit/",
+	)
+	if err != nil {
+		return fmt.Errorf("creating certificate identity: %w", err)
+	}
+
+	// Verify: signature, certificate chain, transparency log, and identity.
+	_, err = verifier.Verify(&b,
+		verify.NewPolicy(
+			verify.WithArtifact(bytes.NewReader(checksumData)),
+			verify.WithCertificateIdentity(certID),
+		),
+	)
+	if err != nil {
+		return fmt.Errorf("verification failed: %w", err)
+	}
+	return nil
+}
+
+// findChecksumForAsset looks up the SHA256 hash for a specific asset in checksums.txt.
+func findChecksumForAsset(checksumData []byte, assetName string) (string, error) {
+	for _, line := range strings.Split(string(checksumData), "\n") {
+		parts := strings.Fields(line)
+		if len(parts) == 2 && parts[1] == assetName {
+			return parts[0], nil
+		}
+	}
+	return "", fmt.Errorf("no checksum found for %s", assetName)
+}
+
+// verifyChecksum compares data's SHA256 hash against an expected hex digest.
+func verifyChecksum(data []byte, expectedHex string) error {
+	actual := sha256.Sum256(data)
+	actualHex := hex.EncodeToString(actual[:])
+	if !strings.EqualFold(actualHex, expectedHex) {
+		return fmt.Errorf("checksum mismatch: expected %s, got %s", expectedHex, actualHex)
+	}
+	return nil
 }
