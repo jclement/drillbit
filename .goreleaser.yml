@@ -50,6 +50,7 @@ brews:
   - repository:
       owner: jclement
       name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
     name: drillbit
     homepage: "https://github.com/jclement/drillbit"
     description: "A tool for managing SSH tunnels to PostgreSQL databases in Docker environments"
