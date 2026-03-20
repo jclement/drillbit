@@ -46,6 +46,17 @@ signs:
     artifacts: checksum
     output: true
 
+brews:
+  - repository:
+      owner: jclement
+      name: homebrew-tap
+    name: drillbit
+    homepage: "https://github.com/jclement/drillbit"
+    description: "A tool for managing SSH tunnels to PostgreSQL databases in Docker environments"
+    license: "MIT"
+    install: |
+      bin.install "drillbit"
+
 changelog:
   sort: asc
   filters:
