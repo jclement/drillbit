@@ -1,0 +1,102 @@
+version: 2
+
+project_name: drillbit
+
+builds:
+  - id: drillbit
+    main: .
+    binary: drillbit
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.ShortCommit}}
+      - -X main.buildDate={{.Date}}
+
+archives:
+  - id: default
+    formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+signs:
+  - cmd: cosign
+    signature: "${artifact}.sigstore.json"
+    args:
+      - "sign-blob"
+      - "--bundle=${signature}"
+      - "${artifact}"
+      - "--yes"
+    artifacts: checksum
+    output: true
+
+brews:
+  - repository:
+      owner: jclement
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    name: drillbit
+    homepage: "https://github.com/jclement/drillbit"
+    description: "A tool for managing SSH tunnels to PostgreSQL databases in Docker environments"
+    license: "MIT"
+    install: |
+      bin.install "drillbit"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"
+
+release:
+  github:
+    owner: jclement
+    name: drillbit
+  draft: false
+  prerelease: auto
+
+dockers:
+  - image_templates:
+      - "ghcr.io/jclement/drillbit:{{ .Version }}-amd64"
+    use: buildx
+    build_flag_templates:
+      - "--platform=linux/amd64"
+    dockerfile: Dockerfile.goreleaser
+    goos: linux
+    goarch: amd64
+  - image_templates:
+      - "ghcr.io/jclement/drillbit:{{ .Version }}-arm64"
+    use: buildx
+    build_flag_templates:
+      - "--platform=linux/arm64"
+    dockerfile: Dockerfile.goreleaser
+    goos: linux
+    goarch: arm64
+
+docker_manifests:
+  - name_template: "ghcr.io/jclement/drillbit:{{ .Version }}"
+    image_templates:
+      - "ghcr.io/jclement/drillbit:{{ .Version }}-amd64"
+      - "ghcr.io/jclement/drillbit:{{ .Version }}-arm64"
+  - name_template: "ghcr.io/jclement/drillbit:latest"
+    image_templates:
+      - "ghcr.io/jclement/drillbit:{{ .Version }}-amd64"
+      - "ghcr.io/jclement/drillbit:{{ .Version }}-arm64"

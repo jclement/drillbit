@@ -1,0 +1,21 @@
+# DrillBit Configuration
+hosts:
+  - name: prod-server-1
+    user: deploy
+    env: prod                              # environment label (optional)
+    databases:
+      - container: myapp_db_1
+        auto: true
+      - container: otherapp_db_1
+        auto: false
+        password: custom-override-password  # optional override
+
+  - name: prod-server-2
+    env: prod
+    # No databases configured - will discover all on this host
+
+  - name: test-server-1
+    env: test
+    databases:
+      - container: testapp_db_1
+        auto: true

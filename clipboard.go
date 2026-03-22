@@ -1,0 +1,30 @@
+package main
+
+import (
+	"fmt"
+	"net/url"
+
+	"github.com/atotto/clipboard"
+)
+
+// connString builds a PostgreSQL connection string for a connected entry.
+func connString(e *Entry) string {
+	return fmt.Sprintf("postgresql://%s:%s@localhost:%d/%s",
+		url.QueryEscape(e.DBUser), url.QueryEscape(e.Password), e.LocalPort, e.Database)
+}
+
+// CopyPassword copies the postgres password to the system clipboard.
+func CopyPassword(e *Entry) error {
+	if e.Password == "" {
+		return fmt.Errorf("no password found for %s/%s", e.Host, e.Container)
+	}
+	return clipboard.WriteAll(e.Password)
+}
+
+// CopyConnStr copies a full postgresql connection string to the clipboard.
+func CopyConnStr(e *Entry) error {
+	if e.Password == "" {
+		return fmt.Errorf("no password found for %s/%s", e.Host, e.Container)
+	}
+	return clipboard.WriteAll(connString(e))
+}

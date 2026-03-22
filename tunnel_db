@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# ── Colors ──────────────────────────────────────────────────────────
+bold="\033[1m"
+dim="\033[2m"
+red="\033[31m"
+green="\033[32m"
+yellow="\033[33m"
+cyan="\033[36m"
+reset="\033[0m"
+
+info()  { printf "${cyan}▸${reset} %s\n" "$*"; }
+ok()    { printf "${green}✔${reset} %s\n" "$*"; }
+warn()  { printf "${yellow}⚠${reset} %s\n" "$*"; }
+err()   { printf "${red}✖${reset} %s\n" "$*" >&2; }
+
+# ── Args ────────────────────────────────────────────────────────────
+HOST="$1"
+TENANT="$2"
+REMOTE_PORT="${3:-5432}"
+LOCAL_PORT="${REMOTE_PORT}"
+
+if [ -z "$HOST" ] || [ -z "$TENANT" ]; then
+  echo ""
+  printf "${bold}Usage:${reset} tunnel_db ${cyan}<host>${reset} ${cyan}<tenant>${reset} ${dim}[port=5432]${reset}\n"
+  echo ""
+  printf "  ${dim}Example:${reset} tunnel_db myserver acme-corp 5432\n"
+  echo ""
+  exit 1
+fi
+
+# ── Banner ──────────────────────────────────────────────────────────
+echo ""
+printf "${bold}┌─────────────────────────────────────┐${reset}\n"
+printf "${bold}│${reset}  ${cyan}DB Tunnel${reset}                          ${bold}│${reset}\n"
+printf "${bold}├─────────────────────────────────────┤${reset}\n"
+printf "${bold}│${reset}  Host     ${dim}│${reset}  %-23s ${bold}│${reset}\n" "$HOST"
+printf "${bold}│${reset}  Tenant   ${dim}│${reset}  %-23s ${bold}│${reset}\n" "$TENANT"
+printf "${bold}│${reset}  Port     ${dim}│${reset}  %-23s ${bold}│${reset}\n" "$REMOTE_PORT"
+printf "${bold}└─────────────────────────────────────┘${reset}\n"
+echo ""
+
+# ── Check local port ───────────────────────────────────────────────
+if lsof -i :"$LOCAL_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+  err "Local port ${bold}$LOCAL_PORT${reset}${red} is already in use"
+  echo ""
+  printf "  ${dim}Listening process:${reset}\n"
+  lsof -i :"$LOCAL_PORT" -sTCP:LISTEN -P -n 2>/dev/null | tail -n +2 | while read -r line; do
+    printf "  ${dim}%s${reset}\n" "$line"
+  done
+  echo ""
+  err "Free the port or specify a different one: tunnel_db $HOST $TENANT $REMOTE_PORT"
+  exit 1
+fi
+
+# ── Verify tenant directory exists on remote ───────────────────────
+info "Checking /docker/$TENANT on ${bold}$HOST${reset} …"
+
+if ! ssh "$HOST" "test -d /docker/$TENANT" 2>/dev/null; then
+  err "Directory ${bold}/docker/$TENANT${reset}${red} does not exist on $HOST"
+  echo ""
+  info "Available tenants:"
+  ssh "$HOST" "ls -1 /docker/ 2>/dev/null" | while read -r t; do
+    printf "    ${dim}•${reset} %s\n" "$t"
+  done
+  echo ""
+  exit 1
+fi
+
+ok "Tenant directory found"
+
+# ── Get container IP ───────────────────────────────────────────────
+info "Resolving container IP …"
+
+CONTAINER_IP=$(ssh "$HOST" "cd /docker/$TENANT && sudo docker compose ps -q db | xargs sudo docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}'" 2>/dev/null)
+
+if [ -z "$CONTAINER_IP" ]; then
+  err "Could not determine container IP"
+  echo ""
+  warn "Possible causes:"
+  printf "  ${dim}•${reset} The ${bold}db${reset} service is not running\n"
+  printf "  ${dim}•${reset} docker compose config is invalid\n"
+  printf "  ${dim}•${reset} Container has no network assigned\n"
+  echo ""
+  info "Check with: ssh $HOST 'cd /docker/$TENANT && sudo docker compose ps'"
+  exit 1
+fi
+
+ok "Container IP: ${bold}$CONTAINER_IP${reset}"
+
+# ── Connect ────────────────────────────────────────────────────────
+echo ""
+printf "${green}${bold}Tunneling${reset} localhost:${bold}$LOCAL_PORT${reset} ${dim}→${reset} $CONTAINER_IP:${bold}$REMOTE_PORT${reset}\n"
+printf "${dim}Press Ctrl+C to close the tunnel${reset}\n"
+echo ""
+
+ssh -N -L "$LOCAL_PORT:$CONTAINER_IP:$REMOTE_PORT" "$HOST"
