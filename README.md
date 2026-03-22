@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="logo.png" alt="DrillBit logo" width="200">
+</p>
+
 # DrillBit
 
 Terminal UI for managing SSH tunnels to PostgreSQL databases across Docker environments.
