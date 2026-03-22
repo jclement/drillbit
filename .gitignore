@@ -4,3 +4,5 @@ coverage.out
 coverage.html
 drillbit
 drillbit.exe
+tunnel_db
+*.patch

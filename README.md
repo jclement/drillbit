@@ -2,6 +2,27 @@
 
 Terminal UI for managing SSH tunnels to PostgreSQL databases across Docker environments.
 
+DrillBit connects to your SSH hosts, discovers running PostgreSQL containers (including PostGIS and TimescaleDB), and lets you open tunnels to them with a single keypress. It assigns deterministic local ports so your connection strings stay stable across restarts.
+
+## Features
+
+- **Auto-discovery** of PostgreSQL, PostGIS, and TimescaleDB containers via Docker
+- **SSH tunnel management** with connection pooling and automatic reconnection
+- **Deterministic ports** — same host/container always maps to the same local port
+- **Credential overrides** — set user/password/database per container and persist to config
+- **Autoconnect** — mark databases to connect on startup
+- **SQL client integration** — launch `pgcli` or `psql` directly from the UI
+- **Clipboard support** — copy passwords or connection strings (auto-clears after 30s)
+- **Self-update** with Sigstore signature verification
+- **Fuzzy filtering** to quickly find databases across many hosts
+
+## Requirements
+
+- SSH access to remote hosts (key-based auth via ssh-agent or key files)
+- Docker running on the remote hosts
+- `sudo docker` access on the remote hosts (used for `docker ps` and `docker inspect`)
+- Containers must have `POSTGRES_PASSWORD` set as an environment variable
+
 ## Installation
 
 ### Homebrew (macOS/Linux)
@@ -34,14 +55,16 @@ hosts:
     env: prod                              # environment label (optional)
     databases:
       - container: myapp_db_1
-        auto: true
+        auto: true                         # connect on startup
       - container: otherapp_db_1
         auto: false
-        password: custom-override-password  # optional override
+        password: custom-override-password # optional override
+        user: myuser                       # optional override
+        database: mydb                     # optional override
 
   - name: prod-server-2
     env: prod
-    # No databases configured - will discover all on this host
+    # No databases listed — will discover all Postgres containers on this host
 
   - name: test-server-1
     env: test
@@ -52,6 +75,15 @@ hosts:
 
 See `config.yaml.example` for a complete example.
 
+### How discovery works
+
+For each configured host, DrillBit:
+
+1. Opens an SSH connection (respects `~/.ssh/config` for HostName, User, Port, IdentityFile)
+2. Runs `sudo docker ps` to find containers with `postgres`, `postgis`, or `timescale` images
+3. Runs `sudo docker inspect` to extract `POSTGRES_USER`, `POSTGRES_PASSWORD`, and `POSTGRES_DB`
+4. Only shows containers that have `POSTGRES_PASSWORD` set
+
 ## CLI Flags
 
 ```
@@ -61,23 +93,26 @@ Options:
   -c, --config <path>   Config file (default: ~/.config/drillbit/config.yaml)
   -e, --edit            Open config in $EDITOR
   -v, --version         Show version
-      --help            Show this help
+  -h, --help            Show this help
 ```
+
+Flags can be combined: `drillbit -c /path/to/config.yaml -e` opens a custom config in your editor.
 
 ## Keybindings
 
 | Key | Action |
 |-----|--------|
-| `Space` / `Enter` | Toggle connect / launch SQL client |
+| `Space` | Toggle connect / disconnect |
+| `Enter` | Connect / launch SQL client (pgcli/psql) |
 | `c` | Configure overrides (user/password/db) |
 | `a` | Toggle autoconnect |
-| `y` | Copy menu (password/connection string) |
-| `/` | Filter entries |
-| `Esc` | Clear filter / quit |
-| `r` / `Ctrl+R` | Refresh hosts |
-| `j` / `k` / `↑` / `↓` | Navigate |
+| `y` | Copy menu (then `p` for password, `c` for connection string) |
+| `/` | Filter entries (fuzzy search) |
+| `Esc` | Clear filter / quit (confirms if connections active) |
+| `r` / `Ctrl+R` | Refresh — re-discover all hosts |
+| `j` / `k` / `Up` / `Down` | Navigate |
 | `?` | Toggle help |
-| `u` | Update (when available) |
+| `u` | Update to latest version (when available) |
 
 ---
 

@@ -48,11 +48,6 @@ func (hc HostConfig) GetOverride(container string) *DatabaseOverride {
 	return nil
 }
 
-// AllHosts returns a flat list of all configured hosts.
-func (cfg *Config) AllHosts() []HostConfig {
-	return cfg.Hosts
-}
-
 // Autoconnect returns a list of containers marked with auto:true.
 func (cfg *Config) Autoconnect() []AutoconnectEntry {
 	var entries []AutoconnectEntry

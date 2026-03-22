@@ -16,27 +16,37 @@ var (
 )
 
 func main() {
-	if len(os.Args) > 1 {
-		switch os.Args[1] {
+	configPath := DefaultConfigPath()
+	editMode := false
+
+	args := os.Args[1:]
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
 		case "--version", "-v":
 			fmt.Printf("drillbit %s (commit: %s, built: %s)\n", version, commit, buildDate)
 			os.Exit(0)
-		case "--help":
+		case "--help", "-h":
 			printUsage()
 			os.Exit(0)
 		case "-e", "--edit":
-			openConfigInEditor(DefaultConfigPath())
-			os.Exit(0)
+			editMode = true
+		case "-c", "--config":
+			if i+1 >= len(args) {
+				fmt.Fprintln(os.Stderr, "Error: --config requires a path argument")
+				os.Exit(1)
+			}
+			i++
+			configPath = args[i]
+		default:
+			fmt.Fprintf(os.Stderr, "Error: unknown option %q\n\n", args[i])
+			printUsage()
+			os.Exit(1)
 		}
 	}
 
-	configPath := DefaultConfigPath()
-	if len(os.Args) > 1 && (os.Args[1] == "--config" || os.Args[1] == "-c") {
-		if len(os.Args) < 3 {
-			fmt.Fprintln(os.Stderr, "Error: --config requires a path argument")
-			os.Exit(1)
-		}
-		configPath = os.Args[2]
+	if editMode {
+		openConfigInEditor(configPath)
+		os.Exit(0)
 	}
 
 	// First run: scaffold config if it doesn't exist.
@@ -104,5 +114,5 @@ func printUsage() {
 	fmt.Println("  -c, --config <path>   Config file (default: ~/.config/drillbit/config.yaml)")
 	fmt.Println("  -e, --edit            Open config in $EDITOR")
 	fmt.Println("  -v, --version         Show version")
-	fmt.Println("      --help            Show this help")
+	fmt.Println("  -h, --help            Show this help")
 }

@@ -743,8 +743,11 @@ func (m *Model) updateCopy(msg tea.KeyPressMsg) []tea.Cmd {
 
 func (m *Model) updateConfirmQuit(msg tea.KeyPressMsg) []tea.Cmd {
 	switch msg.String() {
-	case "esc":
+	case "y", "enter":
 		return m.startDissolve()
+	case "esc", "n":
+		m.mode = modeNormal
+		return nil
 	default:
 		m.mode = modeNormal
 		return nil
@@ -1586,6 +1589,6 @@ func (m Model) renderQuitPrompt() string {
 	msg += " will close. "
 	return "  " +
 		statusConnecting.Render(msg) +
-		helpKeyStyle.Render("Esc") + helpBarStyle.Render(":confirm") + "  " +
-		dimStyle.Render("any other key:cancel")
+		helpKeyStyle.Render("y") + helpBarStyle.Render(":quit") + "  " +
+		helpKeyStyle.Render("Esc") + helpBarStyle.Render(":cancel")
 }

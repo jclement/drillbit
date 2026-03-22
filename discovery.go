@@ -77,7 +77,7 @@ func discoverAll(cfg *Config) tea.Cmd {
 
 	go func() {
 		var wg sync.WaitGroup
-		for _, hc := range cfg.AllHosts() {
+		for _, hc := range cfg.Hosts {
 			wg.Add(1)
 			go func(hc HostConfig) {
 				defer wg.Done()
