@@ -1,0 +1,22 @@
+# DrillBit Configuration Example
+hosts:
+  - name: nyc1
+    user: deploy
+    databases:
+      - container: acme-corp_db_1
+        auto: true
+
+  - name: nyc2
+    user: deploy
+    databases:
+      - container: my-service_db_1
+        auto: false
+        password: custom-override-password  # optional override
+
+  - name: nyc3
+    # No databases configured - will discover all on this host
+
+  - name: test1
+    databases:
+      - container: my-app_db_1
+        auto: true

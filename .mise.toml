@@ -1,0 +1,118 @@
+[tools]
+go = "1.26.0"
+
+[tasks.test]
+description = "Run all tests"
+run = "go test ./..."
+
+[tasks."test:verbose"]
+description = "Run all tests with verbose output"
+run = "go test -v ./..."
+
+[tasks."test:cover"]
+description = "Run tests with coverage report"
+run = "go test -coverprofile=coverage.out ./... && go tool cover -html=coverage.out -o coverage.html"
+
+[tasks.build]
+description = "Build the drillbit binary (dev)"
+run = "go build -o bin/drillbit ."
+
+[tasks.dev]
+description = "Build and run drillbit"
+run = "go build -o bin/drillbit . && ./bin/drillbit"
+
+[tasks.lint]
+description = "Run go vet"
+run = "go vet ./..."
+
+[tasks.release]
+description = "Interactive release: bump version, tag, and push"
+run = """
+#!/bin/bash
+set -e
+
+CURRENT_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+echo "Current version: $CURRENT_TAG"
+
+VERSION_NUM=${CURRENT_TAG#v}
+IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION_NUM"
+
+NEXT_PATCH="v$MAJOR.$MINOR.$((PATCH + 1))"
+NEXT_MINOR="v$MAJOR.$((MINOR + 1)).0"
+NEXT_MAJOR="v$((MAJOR + 1)).0.0"
+
+echo ""
+echo "Select release type:"
+echo "  1) patch  → $NEXT_PATCH"
+echo "  2) minor  → $NEXT_MINOR"
+echo "  3) major  → $NEXT_MAJOR"
+echo "  q) quit"
+echo ""
+read -p "Choice [1]: " CHOICE
+CHOICE=${CHOICE:-1}
+
+case $CHOICE in
+    1) NEW_VERSION=$NEXT_PATCH ;;
+    2) NEW_VERSION=$NEXT_MINOR ;;
+    3) NEW_VERSION=$NEXT_MAJOR ;;
+    q|Q) echo "Cancelled."; exit 0 ;;
+    *) echo "Invalid choice"; exit 1 ;;
+esac
+
+echo ""
+echo "Creating release: $NEW_VERSION"
+git tag -a "$NEW_VERSION" -m "Release $NEW_VERSION"
+echo "Created tag: $NEW_VERSION"
+
+read -p "Push tag to origin? [Y/n]: " CONFIRM
+CONFIRM=${CONFIRM:-Y}
+if [[ ! $CONFIRM =~ ^[Yy]$ ]]; then
+    git tag -d "$NEW_VERSION" >/dev/null 2>&1
+    echo "Cancelled. Tag removed."
+    exit 0
+fi
+
+git push origin "$NEW_VERSION"
+echo "Tag pushed! GitHub Actions will build and release."
+"""
+
+[tasks."release:all"]
+description = "Build release binaries for all platforms (local)"
+run = """
+VERSION=${VERSION:-$(git describe --tags --always --dirty 2>/dev/null || echo "dev")}
+COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+LDFLAGS="-s -w -X main.version=$VERSION -X main.commit=$COMMIT -X main.buildDate=$BUILD_DATE"
+
+echo "Building version: $VERSION"
+mkdir -p dist
+
+echo "  -> linux/amd64"
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="$LDFLAGS" -o dist/drillbit-linux-amd64 .
+
+echo "  -> linux/arm64"
+GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="$LDFLAGS" -o dist/drillbit-linux-arm64 .
+
+echo "  -> darwin/amd64"
+GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="$LDFLAGS" -o dist/drillbit-darwin-amd64 .
+
+echo "  -> darwin/arm64"
+GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build -ldflags="$LDFLAGS" -o dist/drillbit-darwin-arm64 .
+
+echo "Done! Binaries in dist/"
+ls -la dist/
+"""
+
+[tasks."docker:build"]
+description = "Build Docker image (dev)"
+run = """
+VERSION=${VERSION:-$(git describe --tags --always --dirty 2>/dev/null || echo "dev")}
+COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+echo "Building dev image: drillbit:$VERSION"
+docker build --build-arg VERSION=$VERSION --build-arg COMMIT=$COMMIT --build-arg BUILD_DATE=$BUILD_DATE -t drillbit:$VERSION -t drillbit:latest .
+"""
+
+[tasks.clean]
+description = "Clean build artifacts"
+run = "rm -rf bin/ dist/ coverage.out coverage.html"
