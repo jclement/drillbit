@@ -244,13 +244,32 @@ func dialSSH(sshHost string) (*ssh.Client, error) {
 	}
 
 	addr := net.JoinHostPort(hostname, strconv.Itoa(port))
-	client, err := ssh.Dial("tcp", addr, cfg)
+
+	// Use net.Dialer with TCP keepalive enabled so the OS sends TCP-level
+	// keepalive probes. This prevents intermediate network devices (NATs,
+	// firewalls) from dropping idle connections, complementing the SSH-level
+	// keepalive we run separately.
+	dialer := net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 15 * time.Second,
+	}
+	tcpConn, err := dialer.Dial("tcp", addr)
 	if err != nil {
 		if agentConn != nil {
 			agentConn.Close()
 		}
 		return nil, fmt.Errorf("ssh dial %s (%s): %w", alias, addr, err)
 	}
+
+	sshConn, chans, reqs, err := ssh.NewClientConn(tcpConn, addr, cfg)
+	if err != nil {
+		tcpConn.Close()
+		if agentConn != nil {
+			agentConn.Close()
+		}
+		return nil, fmt.Errorf("ssh handshake %s (%s): %w", alias, addr, err)
+	}
+	client := ssh.NewClient(sshConn, chans, reqs)
 
 	// Keep agent connection alive for the lifetime of the SSH client —
 	// the agent may be needed for re-keying on long-lived connections.

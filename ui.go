@@ -241,7 +241,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if e := m.findEntry(msg.key); e != nil {
 			e.Status = StatusConnected
 			e.Error = ""
-			cmds = append(cmds, m.tunnels.MonitorTunnel(msg.key))
 			// If Enter was pressed on a disconnected entry, auto-launch SQL client now.
 			if m.pendingLaunch == msg.key && m.sqlClient != "" {
 				m.pendingLaunch = ""
@@ -263,6 +262,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// SQL client exited with error — flash it but leave connection intact.
 		m.flash = errorMsgStyle.Render(msg.err.Error())
 		cmds = append(cmds, m.clearFlashAfter(3*time.Second))
+		// Run a health check now — event loop was blocked while psql ran.
+		cmds = append(cmds, m.checkTunnelHealth()...)
 
 	case tunnelDisconnectedMsg:
 		if e := m.findEntry(msg.key); e != nil {
@@ -896,7 +897,12 @@ func (m *Model) launchSQLClient(e *Entry) tea.Cmd {
 		if err != nil {
 			return sqlClientErrorMsg{err: fmt.Errorf("%s: %w", m.sqlClient, err)}
 		}
-		return nil
+		// Trigger an immediate health check when the SQL client exits.
+		// While psql was running the Bubbletea event loop was blocked, so
+		// no health checks or tunnel-error messages were processed. This
+		// ensures we detect and reconnect any tunnels that died while the
+		// terminal was handed off.
+		return tunnelHealthMsg{}
 	})
 }
 
@@ -1004,19 +1010,33 @@ func (m *Model) scheduleSpinnerTick() tea.Cmd {
 // spinnerFrames are the animation frames for the discovery spinner.
 var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
-// checkTunnelHealth pings connected tunnels and reconnects dead ones.
+// checkTunnelHealth syncs UI state with TunnelManager reality.
+// The TunnelManager handles reconnection autonomously in the background;
+// this function updates the display and kicks off a Connect only if the
+// background monitor has given up.
 func (m *Model) checkTunnelHealth() []tea.Cmd {
 	var cmds []tea.Cmd
 	for i := range m.entries {
 		e := &m.entries[i]
-		if e.Status != StatusConnected {
-			continue
-		}
 		key := tunnelKey(e)
-		if !m.tunnels.IsAlive(key) {
-			e.Status = StatusConnecting
+		status := m.tunnels.Status(key)
+
+		switch {
+		case e.Status == StatusConnected && status != TunnelAlive:
+			// Tunnel died — background may be reconnecting.
+			if status == TunnelReconnecting {
+				e.Status = StatusConnecting
+				e.Error = ""
+			} else {
+				// Background gave up or never started; reconnect via UI.
+				e.Status = StatusConnecting
+				e.Error = ""
+				cmds = append(cmds, m.tunnels.Connect(e))
+			}
+		case e.Status == StatusConnecting && status == TunnelAlive:
+			// Background reconnection succeeded — update display.
+			e.Status = StatusConnected
 			e.Error = ""
-			cmds = append(cmds, m.tunnels.Connect(e))
 		}
 	}
 	return cmds
