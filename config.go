@@ -4,13 +4,33 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"go.yaml.in/yaml/v3"
 )
 
 // Config is the top-level configuration for DrillBit.
 type Config struct {
-	Hosts []HostConfig `yaml:"hosts"`
+	Hosts     []HostConfig `yaml:"hosts"`
+	BackupDir string       `yaml:"backup_dir,omitempty"`
+}
+
+// BackupDirectory returns the configured backup directory, defaulting to
+// the config file's directory + "/backups".
+func (cfg *Config) BackupDirectory(configPath string) string {
+	if cfg.BackupDir != "" {
+		return expandTildePath(cfg.BackupDir)
+	}
+	return filepath.Join(filepath.Dir(configPath), "backups")
+}
+
+// expandTildePath expands a leading ~ in a path.
+func expandTildePath(p string) string {
+	if strings.HasPrefix(p, "~/") {
+		home, _ := os.UserHomeDir()
+		return filepath.Join(home, p[2:])
+	}
+	return p
 }
 
 // HostConfig represents a single SSH host with optional database overrides.
@@ -119,6 +139,8 @@ func ScaffoldConfig(path string) error {
 	}
 
 	content := `# DrillBit Configuration
+# backup_dir: ~/drillbit-backups  # optional, defaults to config dir + /backups
+
 hosts:
   - name: prod-server-1
     user: deploy

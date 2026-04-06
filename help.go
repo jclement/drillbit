@@ -19,6 +19,8 @@ var helpBindingsAfterSQL = []helpBinding{
 	{"c", "Override credentials (user, pw, db)"},
 	{"a", "Toggle autoconnect"},
 	{"y", "Copy to clipboard (then p or c)"},
+	{"b", "Backup database (pg_dump via container)"},
+	{"B", "Restore database from backup"},
 	{"/", "Filter"},
 	{"r / Ctrl+r", "Refresh — re-discover all hosts"},
 	{"j / \u2193", "Move down"},

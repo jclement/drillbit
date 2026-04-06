@@ -31,8 +31,12 @@ const (
 	modeHelp
 	modeCopy
 	modeConfirmQuit
-	modeEdit     // edit selected entry (user, pw, db)
-	modeQuitting // dissolve animation during shutdown
+	modeEdit           // edit selected entry (user, pw, db)
+	modeQuitting       // dissolve animation during shutdown
+	modeBackup         // backup in progress
+	modeRestore        // restore file picker
+	modeConfirmRestore // confirm restore (destructive!)
+	modeRestoring      // restore in progress
 )
 
 // flashMsg is used to clear the status flash after a delay.
@@ -43,6 +47,8 @@ type clipboardClearMsg struct{}
 
 type dissolveTickMsg struct{}
 type shutdownDoneMsg struct{}
+type backupDoneTimerMsg struct{}
+type restoreDoneTimerMsg struct{}
 type spinnerTickMsg struct{}
 
 // Mouse event messages.
@@ -107,6 +113,18 @@ type Model struct {
 	// Update tracking.
 	updateAvailable *updateInfo
 	updating        bool
+
+	// Backup/restore state.
+	backupMsg     string // current backup progress message
+	backupBytes   int64  // bytes written during backup
+	backupErr     error  // backup error
+	restoreFiles  []backupFile // available backups for restore picker
+	restoreSepIdx int          // separator index in restoreFiles
+	restoreCursor int          // cursor in restore picker
+	restoreMsg    string       // current restore progress message
+	restoreBytes  int64        // bytes read during restore
+	restoreTotal  int64        // total bytes for restore
+	restoreErr    error        // restore error
 
 	// Mouse tracking for double-click detection.
 	lastClickTime time.Time
@@ -285,6 +303,60 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, m.clearFlashAfter(10*time.Second))
 		}
 
+	case backupProgressMsg:
+		if msg.err != nil {
+			m.backupErr = msg.err
+			m.backupMsg = errorMsgStyle.Render(msg.err.Error())
+		} else if msg.done {
+			m.backupMsg = msg.message
+			// Stay in modeBackup for 2s so user sees completion, then auto-return.
+			cmds = append(cmds, tea.Tick(2*time.Second, func(time.Time) tea.Msg {
+				return backupDoneTimerMsg{}
+			}))
+		} else {
+			m.backupMsg = msg.message
+			m.backupBytes = msg.bytesWritten
+		}
+		if msg.next != nil {
+			cmds = append(cmds, msg.next)
+		}
+
+	case restoreProgressMsg:
+		if msg.err != nil {
+			m.restoreErr = msg.err
+			m.restoreMsg = errorMsgStyle.Render(msg.err.Error())
+		} else if msg.done {
+			m.restoreMsg = msg.message
+			cmds = append(cmds, tea.Tick(2*time.Second, func(time.Time) tea.Msg {
+				return restoreDoneTimerMsg{}
+			}))
+		} else {
+			m.restoreMsg = msg.message
+			m.restoreBytes = msg.bytesRead
+			m.restoreTotal = msg.totalSize
+		}
+		if msg.next != nil {
+			cmds = append(cmds, msg.next)
+		}
+
+	case backupDoneTimerMsg:
+		if m.mode == modeBackup {
+			m.mode = modeNormal
+			if m.backupErr == nil {
+				m.flash = flashStyle.Render(m.backupMsg)
+				cmds = append(cmds, m.clearFlashAfter(5*time.Second))
+			}
+		}
+
+	case restoreDoneTimerMsg:
+		if m.mode == modeRestoring {
+			m.mode = modeNormal
+			if m.restoreErr == nil {
+				m.flash = flashStyle.Render(m.restoreMsg)
+				cmds = append(cmds, m.clearFlashAfter(5*time.Second))
+			}
+		}
+
 	case tunnelHealthMsg:
 		cmds = append(cmds, m.checkTunnelHealth()...)
 		cmds = append(cmds, m.scheduleHealthCheck())
@@ -364,6 +436,29 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if msg.String() == "ctrl+c" {
 				return m, tea.Quit
 			}
+		case modeBackup:
+			if msg.String() == "esc" || msg.String() == "ctrl+c" {
+				if m.backupErr != nil {
+					m.mode = modeNormal
+				}
+				// If backup is running, Esc just returns (can't cancel pg_dump easily).
+				// If done or errored, return to normal.
+				m.mode = modeNormal
+			}
+		case modeRestoring:
+			if msg.String() == "esc" || msg.String() == "ctrl+c" {
+				if m.restoreErr != nil {
+					m.mode = modeNormal
+				}
+				// If restore done or errored, return to normal.
+				if m.restoreMsg != "" && m.restoreErr != nil {
+					m.mode = modeNormal
+				}
+			}
+		case modeRestore:
+			cmds = append(cmds, m.updateRestorePicker(msg)...)
+		case modeConfirmRestore:
+			cmds = append(cmds, m.updateConfirmRestore(msg)...)
 		case modeEdit:
 			cmds = append(cmds, m.updateEdit(msg)...)
 		case modeConfirmQuit:
@@ -470,6 +565,33 @@ func (m *Model) updateNormal(msg tea.KeyPressMsg) []tea.Cmd {
 				m.flash = flashStyle.Render(fmt.Sprintf("Autoconnect %s for %s/%s", label, e.Host, e.Container))
 			}
 			cmds = append(cmds, m.clearFlashAfter(2*time.Second))
+		}
+
+	case "b":
+		if e := m.selectedEntry(); e != nil {
+			m.mode = modeBackup
+			m.backupMsg = "Starting backup..."
+			m.backupBytes = 0
+			m.backupErr = nil
+			backupDir := m.cfg.BackupDirectory(m.configPath)
+			cmds = append(cmds, performBackup(e, backupDir))
+		}
+
+	case "B":
+		if e := m.selectedEntry(); e != nil {
+			backupDir := m.cfg.BackupDirectory(m.configPath)
+			allBackups := listBackups(backupDir)
+			if len(allBackups) == 0 {
+				m.flash = errorMsgStyle.Render("No backups found in " + backupDir)
+				cmds = append(cmds, m.clearFlashAfter(3*time.Second))
+			} else {
+				sorted, sepIdx := sortBackupsForEntry(allBackups, e.Host, e.Container, e.Database)
+				m.restoreFiles = sorted
+				m.restoreSepIdx = sepIdx
+				m.restoreCursor = 0
+				m.restoreErr = nil
+				m.mode = modeRestore
+			}
 		}
 
 	case "u":
@@ -670,6 +792,57 @@ func (m *Model) setOverrideField(e *Entry, field int, value string) {
 		m.cfg.Hosts[i].Databases = append(m.cfg.Hosts[i].Databases, override)
 		return
 	}
+}
+
+// updateRestorePicker handles key events in the restore file picker.
+func (m *Model) updateRestorePicker(msg tea.KeyPressMsg) []tea.Cmd {
+	switch msg.String() {
+	case "ctrl+c", "esc":
+		m.mode = modeNormal
+
+	case "j", "down":
+		if m.restoreCursor < len(m.restoreFiles)-1 {
+			m.restoreCursor++
+		}
+
+	case "k", "up":
+		if m.restoreCursor > 0 {
+			m.restoreCursor--
+		}
+
+	case "enter":
+		if m.restoreCursor >= 0 && m.restoreCursor < len(m.restoreFiles) {
+			m.mode = modeConfirmRestore
+		}
+	}
+	return nil
+}
+
+// updateConfirmRestore handles the multi-step restore confirmation.
+func (m *Model) updateConfirmRestore(msg tea.KeyPressMsg) []tea.Cmd {
+	var cmds []tea.Cmd
+
+	switch msg.String() {
+	case "ctrl+c", "esc", "n":
+		m.mode = modeRestore
+
+	case "y":
+		// Start the restore.
+		e := m.selectedEntry()
+		if e == nil {
+			m.mode = modeNormal
+			return nil
+		}
+		bf := m.restoreFiles[m.restoreCursor]
+		m.mode = modeRestoring
+		m.restoreMsg = "Starting restore..."
+		m.restoreBytes = 0
+		m.restoreTotal = bf.Size
+		m.restoreErr = nil
+		cmds = append(cmds, performRestore(e, bf.Path))
+	}
+
+	return cmds
 }
 
 func (m *Model) updateFilter(msg tea.KeyPressMsg) []tea.Cmd {
@@ -1058,6 +1231,18 @@ func (m Model) View() tea.View {
 	}
 	if m.mode == modeEdit {
 		return altView(m.renderEditOverlay())
+	}
+	if m.mode == modeBackup {
+		return altView(m.renderBackupProgress())
+	}
+	if m.mode == modeRestore {
+		return altView(m.renderRestorePicker())
+	}
+	if m.mode == modeConfirmRestore {
+		return altView(m.renderConfirmRestore())
+	}
+	if m.mode == modeRestoring {
+		return altView(m.renderRestoreProgress())
 	}
 	if m.mode == modeQuitting {
 		return altView(m.renderDissolve())
@@ -1543,6 +1728,211 @@ func (m Model) renderEditOverlay() string {
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
 }
 
+// renderBackupProgress renders the backup progress overlay.
+func (m Model) renderBackupProgress() string {
+	e := m.selectedEntry()
+	target := "unknown"
+	if e != nil {
+		target = fmt.Sprintf("%s/%s/%s", e.Host, e.Container, e.Database)
+	}
+
+	var b strings.Builder
+	b.WriteString(headerAccent.Render("Backup — "+target) + "\n\n")
+
+	if m.backupErr != nil {
+		b.WriteString("  " + errorMsgStyle.Render("Error: "+m.backupErr.Error()) + "\n\n")
+		b.WriteString("  " + helpKeyStyle.Render("Esc") + helpBarStyle.Render(" to return") + "\n")
+	} else {
+		// Progress bar.
+		b.WriteString("  " + m.backupMsg + "\n\n")
+
+		if m.backupBytes > 0 {
+			barWidth := 40
+			// We don't know total, so show an indeterminate-style bar.
+			b.WriteString("  " + renderActivityBar(barWidth, m.backupBytes) + "\n\n")
+			b.WriteString("  " + dimStyle.Render(fmt.Sprintf("Written: %s compressed", formatBytes(m.backupBytes))) + "\n")
+		}
+
+		if strings.Contains(m.backupMsg, "complete") {
+			b.WriteString("\n  " + flashStyle.Render("Returning to main view...") + "\n")
+		}
+	}
+
+	box := helpOverlayStyle.Render(b.String())
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
+}
+
+// renderRestorePicker renders the backup file picker for restore.
+func (m Model) renderRestorePicker() string {
+	e := m.selectedEntry()
+	target := "unknown"
+	if e != nil {
+		target = fmt.Sprintf("%s/%s/%s", e.Host, e.Container, e.Database)
+	}
+
+	var b strings.Builder
+	b.WriteString(headerAccent.Render("Restore to "+target) + "\n")
+	b.WriteString(dimStyle.Render("  Select a backup to restore") + "\n\n")
+
+	// Show backups with separator.
+	maxVisible := m.height - 14
+	if maxVisible < 5 {
+		maxVisible = 5
+	}
+
+	start := 0
+	if m.restoreCursor >= maxVisible {
+		start = m.restoreCursor - maxVisible + 1
+	}
+	end := start + maxVisible
+	if end > len(m.restoreFiles) {
+		end = len(m.restoreFiles)
+	}
+
+	for i := start; i < end; i++ {
+		// Draw separator between matching and non-matching.
+		if i == m.restoreSepIdx && m.restoreSepIdx > 0 && i > start {
+			b.WriteString("  " + dimStyle.Render(strings.Repeat("─", 50)) + "\n")
+		}
+
+		bf := m.restoreFiles[i]
+		cursor := "  "
+		if i == m.restoreCursor {
+			cursor = helpKeyStyle.Render("▶ ")
+		}
+
+		ts := bf.Timestamp.Format("2006-01-02 15:04:05")
+		size := formatBytes(bf.Size)
+		label := fmt.Sprintf("%s/%s/%s", bf.Host, bf.Container, bf.Database)
+
+		var row string
+		if i < m.restoreSepIdx {
+			// Matching — highlight.
+			row = fmt.Sprintf("%s%-24s  %s  %s", cursor, flashStyle.Render(label), ts, dimStyle.Render(size))
+		} else {
+			row = fmt.Sprintf("%s%-24s  %s  %s", cursor, dimStyle.Render(label), dimStyle.Render(ts), dimStyle.Render(size))
+		}
+		b.WriteString(row + "\n")
+	}
+
+	if len(m.restoreFiles) > maxVisible {
+		b.WriteString(dimStyle.Render(fmt.Sprintf("  ↑↓ %d / %d", end-start, len(m.restoreFiles))) + "\n")
+	}
+
+	b.WriteString("\n")
+	b.WriteString("  " + helpKeyStyle.Render("Enter") + helpBarStyle.Render(":select") + "  " +
+		helpKeyStyle.Render("↑↓") + helpBarStyle.Render(":navigate") + "  " +
+		helpKeyStyle.Render("Esc") + helpBarStyle.Render(":cancel") + "\n")
+
+	box := helpOverlayStyle.Render(b.String())
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
+}
+
+// renderConfirmRestore renders the scary confirmation dialog.
+func (m Model) renderConfirmRestore() string {
+	e := m.selectedEntry()
+	target := "unknown"
+	if e != nil {
+		target = fmt.Sprintf("%s/%s/%s", e.Host, e.Container, e.Database)
+	}
+
+	bf := m.restoreFiles[m.restoreCursor]
+
+	var b strings.Builder
+	b.WriteString(errorMsgStyle.Render("⚠  DESTRUCTIVE OPERATION  ⚠") + "\n\n")
+	b.WriteString("  This will:\n")
+	b.WriteString("  " + errorMsgStyle.Render("1. DROP the entire public schema") + "\n")
+	b.WriteString("  " + errorMsgStyle.Render("2. Recreate it empty") + "\n")
+	b.WriteString("  " + errorMsgStyle.Render("3. Restore from the selected backup") + "\n\n")
+
+	b.WriteString("  " + dimStyle.Render("Target:  ") + headerAccent.Render(target) + "\n")
+	b.WriteString("  " + dimStyle.Render("Backup:  ") + fmt.Sprintf("%s/%s/%s", bf.Host, bf.Container, bf.Database) + "\n")
+	b.WriteString("  " + dimStyle.Render("Date:    ") + bf.Timestamp.Format("2006-01-02 15:04:05") + "\n")
+	b.WriteString("  " + dimStyle.Render("Size:    ") + formatBytes(bf.Size) + "\n\n")
+
+	b.WriteString("  " + errorMsgStyle.Render("All existing data in public schema will be lost!") + "\n\n")
+	b.WriteString("  " + helpKeyStyle.Render("y") + helpBarStyle.Render(" to confirm restore") + "  " +
+		helpKeyStyle.Render("n/Esc") + helpBarStyle.Render(" to cancel") + "\n")
+
+	box := helpOverlayStyle.Render(b.String())
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
+}
+
+// renderRestoreProgress renders the restore progress overlay.
+func (m Model) renderRestoreProgress() string {
+	e := m.selectedEntry()
+	target := "unknown"
+	if e != nil {
+		target = fmt.Sprintf("%s/%s/%s", e.Host, e.Container, e.Database)
+	}
+
+	var b strings.Builder
+	b.WriteString(headerAccent.Render("Restoring — "+target) + "\n\n")
+
+	if m.restoreErr != nil {
+		b.WriteString("  " + errorMsgStyle.Render("Error: "+m.restoreErr.Error()) + "\n\n")
+		b.WriteString("  " + helpKeyStyle.Render("Esc") + helpBarStyle.Render(" to return") + "\n")
+	} else {
+		b.WriteString("  " + m.restoreMsg + "\n\n")
+
+		if m.restoreTotal > 0 {
+			barWidth := 40
+			pct := float64(m.restoreBytes) / float64(m.restoreTotal)
+			if pct > 1 {
+				pct = 1
+			}
+			b.WriteString("  " + renderProgressBar(barWidth, pct) + "\n\n")
+			b.WriteString("  " + dimStyle.Render(fmt.Sprintf("%s / %s", formatBytes(m.restoreBytes), formatBytes(m.restoreTotal))) + "\n")
+		}
+
+		if strings.Contains(m.restoreMsg, "complete") {
+			b.WriteString("\n  " + flashStyle.Render("Returning to main view...") + "\n")
+		}
+	}
+
+	box := helpOverlayStyle.Render(b.String())
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
+}
+
+// renderProgressBar draws a [=====>    ] style bar.
+func renderProgressBar(width int, pct float64) string {
+	filled := int(float64(width) * pct)
+	if filled > width {
+		filled = width
+	}
+	empty := width - filled
+
+	bar := statusConnected.Render(strings.Repeat("━", filled))
+	if empty > 0 {
+		bar += dimStyle.Render(strings.Repeat("─", empty))
+	}
+	return fmt.Sprintf("[%s] %d%%", bar, int(pct*100))
+}
+
+// renderActivityBar draws an indeterminate activity bar based on byte count.
+func renderActivityBar(width int, bytes int64) string {
+	// Pulse effect: a 6-wide block that bounces across the bar.
+	pulseWidth := 6
+	if pulseWidth > width {
+		pulseWidth = width
+	}
+	// Use bytes to drive the animation position.
+	pos := int(bytes/1024) % (2 * (width - pulseWidth))
+	if pos >= width-pulseWidth {
+		pos = 2*(width-pulseWidth) - pos // bounce back
+	}
+
+	var bar strings.Builder
+	for i := 0; i < width; i++ {
+		if i >= pos && i < pos+pulseWidth {
+			bar.WriteString(statusConnecting.Render("━"))
+		} else {
+			bar.WriteString(dimStyle.Render("─"))
+		}
+	}
+	return fmt.Sprintf("[%s]", bar.String())
+}
+
 // renderHelpBar renders the compact keybinding bar at the bottom.
 func (m Model) renderHelpBar() string {
 	keys := []struct{ key, desc string }{
@@ -1555,6 +1945,8 @@ func (m Model) renderHelpBar() string {
 		{"c", "override"},
 		{"a", "auto"},
 		{"y", "copy"},
+		{"b", "backup"},
+		{"B", "restore"},
 		{"/", "filter"},
 		{"r", "refresh"},
 		{"?", "help"},
