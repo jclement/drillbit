@@ -111,7 +111,8 @@ func discoverHostStreaming(hc HostConfig, ch chan<- discoverUpdate) {
 	ch <- discoverUpdate{log: &logEntry{tag: "OK", text: fmt.Sprintf("%s — secure channel open", hc.Name)}}
 	ch <- discoverUpdate{log: &logEntry{tag: "SCAN", text: fmt.Sprintf("%s — interrogating docker daemon...", hc.Name)}}
 
-	containers, err := discoverDockerContainers(client)
+	docker := dockerCmd(client)
+	containers, err := discoverDockerContainers(client, docker)
 	if err != nil {
 		ch <- discoverUpdate{
 			log:      &logEntry{tag: "ERR", text: fmt.Sprintf("%s — %v", hc.Name, err)},
@@ -187,10 +188,11 @@ type containerInfo struct {
 }
 
 // discoverDockerContainers queries Docker API directly for Postgres containers.
-func discoverDockerContainers(client *ssh.Client) ([]containerInfo, error) {
+// docker is the command prefix ("docker" or "sudo docker").
+func discoverDockerContainers(client *ssh.Client, docker string) ([]containerInfo, error) {
 	script := `
 # Find all running containers and filter for postgres-related images
-containers=$(sudo docker ps --format '{{.ID}}|{{.Image}}' 2>/dev/null || true)
+containers=$(` + docker + ` ps --format '{{.ID}}|{{.Image}}' 2>/dev/null || true)
 if [ -z "$containers" ]; then
     exit 0
 fi
@@ -198,7 +200,7 @@ fi
 # Filter for postgres, postgis, timescale images
 echo "$containers" | grep -iE 'postgres|postgis|timescale' | while IFS='|' read -r cid image; do
     # Extract name, image, and environment variables
-    sudo docker inspect "$cid" --format '{{.Name}}|||'"$image"'|||{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null || continue
+    ` + docker + ` inspect "$cid" --format '{{.Name}}|||'"$image"'|||{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null || continue
     echo "%%%REC%%%"
 done
 `

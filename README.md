@@ -24,7 +24,7 @@ DrillBit connects to your SSH hosts, discovers running PostgreSQL containers (in
 
 - SSH access to remote hosts (key-based auth via ssh-agent or key files)
 - Docker running on the remote hosts
-- `sudo docker` access on the remote hosts (used for `docker ps` and `docker inspect`)
+- Docker access on the remote hosts (tries user permissions first, falls back to `sudo`)
 - Containers must have `POSTGRES_PASSWORD` set as an environment variable
 
 ## Installation
@@ -84,8 +84,8 @@ See `config.yaml.example` for a complete example.
 For each configured host, DrillBit:
 
 1. Opens an SSH connection (respects `~/.ssh/config` for HostName, User, Port, IdentityFile)
-2. Runs `sudo docker ps` to find containers with `postgres`, `postgis`, or `timescale` images
-3. Runs `sudo docker inspect` to extract `POSTGRES_USER`, `POSTGRES_PASSWORD`, and `POSTGRES_DB`
+2. Runs `docker ps` to find containers with `postgres`, `postgis`, or `timescale` images (falls back to `sudo docker` if needed)
+3. Runs `docker inspect` to extract `POSTGRES_USER`, `POSTGRES_PASSWORD`, and `POSTGRES_DB`
 4. Only shows containers that have `POSTGRES_PASSWORD` set
 
 ## CLI Flags

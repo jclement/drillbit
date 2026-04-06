@@ -378,10 +378,12 @@ func forward(local, remote net.Conn) {
 }
 
 // resolveContainerIP gets the Docker container IP by name using docker inspect.
+// Tries without sudo first, falls back to sudo if needed.
 func resolveContainerIP(client *ssh.Client, containerName string) (string, error) {
+	docker := dockerCmd(client)
 	script := fmt.Sprintf(
-		`sudo docker inspect %s -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}'`,
-		shellQuote(containerName),
+		`%s inspect %s -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}'`,
+		docker, shellQuote(containerName),
 	)
 	ip, err := runSSHCommand(client, script)
 	if err != nil {

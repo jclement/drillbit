@@ -359,6 +359,17 @@ func expandTilde(p string) string {
 	return p
 }
 
+// dockerCmd returns the docker command prefix for a given SSH client.
+// It probes whether the user can run docker without sudo, falling back
+// to "sudo docker" only if needed.
+func dockerCmd(client *ssh.Client) string {
+	_, err := runSSHCommand(client, "docker info >/dev/null 2>&1")
+	if err == nil {
+		return "docker"
+	}
+	return "sudo docker"
+}
+
 // shellQuote quotes a string for safe interpolation into a remote shell command.
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"

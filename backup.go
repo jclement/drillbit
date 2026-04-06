@@ -200,8 +200,11 @@ func performBackup(e *Entry, backupDir string) tea.Cmd {
 
 		ch <- backupProgressMsg{message: "Running pg_dump in container..."}
 
+		docker := dockerCmd(client)
+
 		// Run pg_dump inside the Docker container.
-		cmd := fmt.Sprintf("sudo docker exec %s pg_dump -U %s --no-owner --no-acl %s",
+		cmd := fmt.Sprintf("%s exec %s pg_dump -U %s --no-owner --no-acl %s",
+			docker,
 			shellQuote(e.Container),
 			shellQuote(e.DBUser),
 			shellQuote(e.Database),
@@ -340,8 +343,11 @@ func performRestore(e *Entry, backupPath string) tea.Cmd {
 		// Phase 1: Drop and recreate public schema.
 		ch <- restoreProgressMsg{phase: "drop", message: "Dropping public schema..."}
 
+		docker := dockerCmd(client)
+
 		dropSQL := "DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public; GRANT ALL ON SCHEMA public TO public;"
-		dropCmd := fmt.Sprintf("sudo docker exec %s psql -U %s -d %s -c %s",
+		dropCmd := fmt.Sprintf("%s exec %s psql -U %s -d %s -c %s",
+			docker,
 			shellQuote(e.Container),
 			shellQuote(e.DBUser),
 			shellQuote(e.Database),
@@ -380,7 +386,8 @@ func performRestore(e *Entry, backupPath string) tea.Cmd {
 		defer gzr.Close()
 
 		// Run psql inside the Docker container, piping stdin.
-		restoreCmd := fmt.Sprintf("sudo docker exec -i %s psql -U %s -d %s --quiet -v ON_ERROR_STOP=0",
+		restoreCmd := fmt.Sprintf("%s exec -i %s psql -U %s -d %s --quiet -v ON_ERROR_STOP=0",
+			docker,
 			shellQuote(e.Container),
 			shellQuote(e.DBUser),
 			shellQuote(e.Database),
