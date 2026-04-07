@@ -115,13 +115,14 @@ type Model struct {
 	updating        bool
 
 	// Backup/restore state.
-	backupMsg     string // current backup progress message
-	backupBytes   int64  // bytes written during backup
-	backupErr     error  // backup error
-	restoreFiles  []backupFile // available backups for restore picker
-	restoreSepIdx int          // separator index in restoreFiles
-	restoreCursor int          // cursor in restore picker
-	restoreMsg    string       // current restore progress message
+	backupMsg       string       // current backup progress message
+	backupBytes     int64        // bytes written during backup
+	backupErr       error        // backup error
+	restoreFiles    []backupFile // available backups for restore picker
+	restoreSepIdx   int          // separator index in restoreFiles
+	restoreCursor   int          // cursor in restore picker
+	restoreSelected *backupFile  // frozen selection for confirm/restore phases
+	restoreMsg      string       // current restore progress message
 	restoreBytes  int64        // bytes read during restore
 	restoreTotal  int64        // total bytes for restore
 	restoreErr    error        // restore error
@@ -304,21 +305,26 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case backupProgressMsg:
+		// Always update state regardless of current mode — the goroutine
+		// keeps sending even if the user pressed Esc.
 		if msg.err != nil {
 			m.backupErr = msg.err
 			m.backupMsg = errorMsgStyle.Render(msg.err.Error())
+			// Drain remaining channel messages (next is nil on done).
 		} else if msg.done {
 			m.backupMsg = msg.message
-			// Stay in modeBackup for 2s so user sees completion, then auto-return.
-			cmds = append(cmds, tea.Tick(2*time.Second, func(time.Time) tea.Msg {
-				return backupDoneTimerMsg{}
-			}))
 		} else {
 			m.backupMsg = msg.message
 			m.backupBytes = msg.bytesWritten
 		}
 		if msg.next != nil {
 			cmds = append(cmds, msg.next)
+		}
+		// Auto-return only when we're still showing the backup overlay.
+		if msg.done && m.mode == modeBackup {
+			cmds = append(cmds, tea.Tick(2*time.Second, func(time.Time) tea.Msg {
+				return backupDoneTimerMsg{}
+			}))
 		}
 
 	case restoreProgressMsg:
@@ -327,9 +333,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.restoreMsg = errorMsgStyle.Render(msg.err.Error())
 		} else if msg.done {
 			m.restoreMsg = msg.message
-			cmds = append(cmds, tea.Tick(2*time.Second, func(time.Time) tea.Msg {
-				return restoreDoneTimerMsg{}
-			}))
 		} else {
 			m.restoreMsg = msg.message
 			m.restoreBytes = msg.bytesRead
@@ -338,12 +341,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.next != nil {
 			cmds = append(cmds, msg.next)
 		}
+		if msg.done && m.mode == modeRestoring {
+			cmds = append(cmds, tea.Tick(2*time.Second, func(time.Time) tea.Msg {
+				return restoreDoneTimerMsg{}
+			}))
+		}
 
 	case backupDoneTimerMsg:
 		if m.mode == modeBackup {
 			m.mode = modeNormal
 			if m.backupErr == nil {
 				m.flash = flashStyle.Render(m.backupMsg)
+				cmds = append(cmds, m.clearFlashAfter(5*time.Second))
+			} else {
+				m.flash = errorMsgStyle.Render("Backup failed")
 				cmds = append(cmds, m.clearFlashAfter(5*time.Second))
 			}
 		}
@@ -353,6 +364,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.mode = modeNormal
 			if m.restoreErr == nil {
 				m.flash = flashStyle.Render(m.restoreMsg)
+				cmds = append(cmds, m.clearFlashAfter(5*time.Second))
+			} else {
+				m.flash = errorMsgStyle.Render("Restore failed")
 				cmds = append(cmds, m.clearFlashAfter(5*time.Second))
 			}
 		}
@@ -438,22 +452,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case modeBackup:
 			if msg.String() == "esc" || msg.String() == "ctrl+c" {
-				if m.backupErr != nil {
+				// Allow exit if errored or done (message contains "complete").
+				if m.backupErr != nil || strings.Contains(m.backupMsg, "complete") {
 					m.mode = modeNormal
 				}
-				// If backup is running, Esc just returns (can't cancel pg_dump easily).
-				// If done or errored, return to normal.
-				m.mode = modeNormal
+				// Otherwise backup is in-flight — ignore Esc.
 			}
 		case modeRestoring:
 			if msg.String() == "esc" || msg.String() == "ctrl+c" {
-				if m.restoreErr != nil {
+				if m.restoreErr != nil || strings.Contains(m.restoreMsg, "complete") {
 					m.mode = modeNormal
 				}
-				// If restore done or errored, return to normal.
-				if m.restoreMsg != "" && m.restoreErr != nil {
-					m.mode = modeNormal
-				}
+				// Otherwise restore is in-flight — ignore Esc.
 			}
 		case modeRestore:
 			cmds = append(cmds, m.updateRestorePicker(msg)...)
@@ -812,6 +822,8 @@ func (m *Model) updateRestorePicker(msg tea.KeyPressMsg) []tea.Cmd {
 
 	case "enter":
 		if m.restoreCursor >= 0 && m.restoreCursor < len(m.restoreFiles) {
+			bf := m.restoreFiles[m.restoreCursor]
+			m.restoreSelected = &bf
 			m.mode = modeConfirmRestore
 		}
 	}
@@ -829,11 +841,11 @@ func (m *Model) updateConfirmRestore(msg tea.KeyPressMsg) []tea.Cmd {
 	case "y":
 		// Start the restore.
 		e := m.selectedEntry()
-		if e == nil {
+		if e == nil || m.restoreSelected == nil {
 			m.mode = modeNormal
 			return nil
 		}
-		bf := m.restoreFiles[m.restoreCursor]
+		bf := m.restoreSelected
 		m.mode = modeRestoring
 		m.restoreMsg = "Starting restore..."
 		m.restoreBytes = 0
@@ -1728,7 +1740,7 @@ func (m Model) renderEditOverlay() string {
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
 }
 
-// renderBackupProgress renders the backup progress overlay.
+// renderBackupProgress renders the backup progress as a full-screen view.
 func (m Model) renderBackupProgress() string {
 	e := m.selectedEntry()
 	target := "unknown"
@@ -1737,18 +1749,22 @@ func (m Model) renderBackupProgress() string {
 	}
 
 	var b strings.Builder
-	b.WriteString(headerAccent.Render("Backup — "+target) + "\n\n")
+	b.WriteString("\n")
+	b.WriteString(headerStyle.Render(" \U0001f529 DRILLBIT "))
+	b.WriteString(headerAccent.Render("  Backup — " + target))
+	b.WriteString("\n\n")
 
 	if m.backupErr != nil {
 		b.WriteString("  " + errorMsgStyle.Render("Error: "+m.backupErr.Error()) + "\n\n")
 		b.WriteString("  " + helpKeyStyle.Render("Esc") + helpBarStyle.Render(" to return") + "\n")
 	} else {
-		// Progress bar.
 		b.WriteString("  " + m.backupMsg + "\n\n")
 
 		if m.backupBytes > 0 {
-			barWidth := 40
-			// We don't know total, so show an indeterminate-style bar.
+			barWidth := min(m.width-6, 60)
+			if barWidth < 20 {
+				barWidth = 20
+			}
 			b.WriteString("  " + renderActivityBar(barWidth, m.backupBytes) + "\n\n")
 			b.WriteString("  " + dimStyle.Render(fmt.Sprintf("Written: %s compressed", formatBytes(m.backupBytes))) + "\n")
 		}
@@ -1758,11 +1774,10 @@ func (m Model) renderBackupProgress() string {
 		}
 	}
 
-	box := helpOverlayStyle.Render(b.String())
-	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
+	return b.String()
 }
 
-// renderRestorePicker renders the backup file picker for restore.
+// renderRestorePicker renders the backup file picker as a full-screen view.
 func (m Model) renderRestorePicker() string {
 	e := m.selectedEntry()
 	target := "unknown"
@@ -1771,11 +1786,27 @@ func (m Model) renderRestorePicker() string {
 	}
 
 	var b strings.Builder
-	b.WriteString(headerAccent.Render("Restore to "+target) + "\n")
-	b.WriteString(dimStyle.Render("  Select a backup to restore") + "\n\n")
 
-	// Show backups with separator.
-	maxVisible := m.height - 14
+	// Header — same style as main view.
+	b.WriteString("\n")
+	b.WriteString(headerStyle.Render(" \U0001f529 DRILLBIT "))
+	b.WriteString(headerAccent.Render("  Restore to " + target))
+	b.WriteString("\n\n")
+
+	b.WriteString("  " + dimStyle.Render("Select a backup to restore") + "\n\n")
+
+	// Column header.
+	labelW := 40
+	if m.width > 100 {
+		labelW = 50
+	}
+	hdr := fmt.Sprintf("  %-*s  %-19s  %s", labelW, "HOST/CONTAINER/DATABASE", "DATE", "SIZE")
+	b.WriteString(colHeaderStyle.Render(hdr) + "\n")
+	sep := "  " + strings.Repeat("\u2500", min(m.width-4, len(hdr)))
+	b.WriteString(dimStyle.Render(sep) + "\n")
+
+	// Rows — use full terminal height.
+	maxVisible := m.height - 10
 	if maxVisible < 5 {
 		maxVisible = 5
 	}
@@ -1792,40 +1823,45 @@ func (m Model) renderRestorePicker() string {
 	for i := start; i < end; i++ {
 		// Draw separator between matching and non-matching.
 		if i == m.restoreSepIdx && m.restoreSepIdx > 0 && i > start {
-			b.WriteString("  " + dimStyle.Render(strings.Repeat("─", 50)) + "\n")
+			b.WriteString("  " + dimStyle.Render(strings.Repeat("─", min(m.width-4, len(hdr)))) + "\n")
 		}
 
 		bf := m.restoreFiles[i]
-		cursor := "  "
-		if i == m.restoreCursor {
-			cursor = helpKeyStyle.Render("▶ ")
-		}
+		isSelected := i == m.restoreCursor
 
 		ts := bf.Timestamp.Format("2006-01-02 15:04:05")
 		size := formatBytes(bf.Size)
 		label := fmt.Sprintf("%s/%s/%s", bf.Host, bf.Container, bf.Database)
+		label = truncate(label, labelW)
 
-		var row string
-		if i < m.restoreSepIdx {
-			// Matching — highlight.
-			row = fmt.Sprintf("%s%-24s  %s  %s", cursor, flashStyle.Render(label), ts, dimStyle.Render(size))
+		row := fmt.Sprintf("  %-*s  %-19s  %s", labelW, label, ts, size)
+
+		if isSelected {
+			// Pad to terminal width for full highlight.
+			if pad := m.width - lipgloss.Width(row); pad > 0 {
+				row += strings.Repeat(" ", pad)
+			}
+			b.WriteString(selectedStyle.Render(row) + "\n")
+		} else if i < m.restoreSepIdx {
+			// Matching entries — normal color.
+			b.WriteString(row + "\n")
 		} else {
-			row = fmt.Sprintf("%s%-24s  %s  %s", cursor, dimStyle.Render(label), dimStyle.Render(ts), dimStyle.Render(size))
+			b.WriteString(dimStyle.Render(row) + "\n")
 		}
-		b.WriteString(row + "\n")
 	}
 
+	// Scroll indicator.
 	if len(m.restoreFiles) > maxVisible {
-		b.WriteString(dimStyle.Render(fmt.Sprintf("  ↑↓ %d / %d", end-start, len(m.restoreFiles))) + "\n")
+		b.WriteString(dimStyle.Render(fmt.Sprintf("  \u2191\u2193 %d / %d", end-start, len(m.restoreFiles))) + "\n")
 	}
 
+	// Bottom bar.
 	b.WriteString("\n")
-	b.WriteString("  " + helpKeyStyle.Render("Enter") + helpBarStyle.Render(":select") + "  " +
-		helpKeyStyle.Render("↑↓") + helpBarStyle.Render(":navigate") + "  " +
+	b.WriteString("  " + helpKeyStyle.Render("Enter") + helpBarStyle.Render(":restore") + "  " +
+		helpKeyStyle.Render("j/k") + helpBarStyle.Render(":navigate") + "  " +
 		helpKeyStyle.Render("Esc") + helpBarStyle.Render(":cancel") + "\n")
 
-	box := helpOverlayStyle.Render(b.String())
-	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
+	return b.String()
 }
 
 // renderConfirmRestore renders the scary confirmation dialog.
@@ -1836,29 +1872,33 @@ func (m Model) renderConfirmRestore() string {
 		target = fmt.Sprintf("%s/%s/%s", e.Host, e.Container, e.Database)
 	}
 
-	bf := m.restoreFiles[m.restoreCursor]
+	if m.restoreSelected == nil {
+		return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center,
+			helpOverlayStyle.Render(errorMsgStyle.Render("No backup selected")))
+	}
+	bf := *m.restoreSelected
 
 	var b strings.Builder
-	b.WriteString(errorMsgStyle.Render("⚠  DESTRUCTIVE OPERATION  ⚠") + "\n\n")
+	b.WriteString(errorMsgStyle.Render("⚠  RESTORE DATABASE  ⚠") + "\n\n")
 	b.WriteString("  This will:\n")
-	b.WriteString("  " + errorMsgStyle.Render("1. DROP the entire public schema") + "\n")
-	b.WriteString("  " + errorMsgStyle.Render("2. Recreate it empty") + "\n")
-	b.WriteString("  " + errorMsgStyle.Render("3. Restore from the selected backup") + "\n\n")
+	b.WriteString("  " + statusConnected.Render("1. Auto-backup current data (safety net)") + "\n")
+	b.WriteString("  " + errorMsgStyle.Render("2. DROP public schema and recreate empty") + "\n")
+	b.WriteString("  " + dimStyle.Render("3. Restore from selected backup") + "\n\n")
 
 	b.WriteString("  " + dimStyle.Render("Target:  ") + headerAccent.Render(target) + "\n")
 	b.WriteString("  " + dimStyle.Render("Backup:  ") + fmt.Sprintf("%s/%s/%s", bf.Host, bf.Container, bf.Database) + "\n")
 	b.WriteString("  " + dimStyle.Render("Date:    ") + bf.Timestamp.Format("2006-01-02 15:04:05") + "\n")
 	b.WriteString("  " + dimStyle.Render("Size:    ") + formatBytes(bf.Size) + "\n\n")
 
-	b.WriteString("  " + errorMsgStyle.Render("All existing data in public schema will be lost!") + "\n\n")
+	b.WriteString("  " + flashStyle.Render("A safety backup is created first — you can always recover.") + "\n\n")
 	b.WriteString("  " + helpKeyStyle.Render("y") + helpBarStyle.Render(" to confirm restore") + "  " +
 		helpKeyStyle.Render("n/Esc") + helpBarStyle.Render(" to cancel") + "\n")
 
-	box := helpOverlayStyle.Render(b.String())
+	box := wideOverlayStyle.Render(b.String())
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
 }
 
-// renderRestoreProgress renders the restore progress overlay.
+// renderRestoreProgress renders the restore progress as a full-screen view.
 func (m Model) renderRestoreProgress() string {
 	e := m.selectedEntry()
 	target := "unknown"
@@ -1867,7 +1907,10 @@ func (m Model) renderRestoreProgress() string {
 	}
 
 	var b strings.Builder
-	b.WriteString(headerAccent.Render("Restoring — "+target) + "\n\n")
+	b.WriteString("\n")
+	b.WriteString(headerStyle.Render(" \U0001f529 DRILLBIT "))
+	b.WriteString(headerAccent.Render("  Restoring — " + target))
+	b.WriteString("\n\n")
 
 	if m.restoreErr != nil {
 		b.WriteString("  " + errorMsgStyle.Render("Error: "+m.restoreErr.Error()) + "\n\n")
@@ -1876,7 +1919,10 @@ func (m Model) renderRestoreProgress() string {
 		b.WriteString("  " + m.restoreMsg + "\n\n")
 
 		if m.restoreTotal > 0 {
-			barWidth := 40
+			barWidth := min(m.width-6, 60)
+			if barWidth < 20 {
+				barWidth = 20
+			}
 			pct := float64(m.restoreBytes) / float64(m.restoreTotal)
 			if pct > 1 {
 				pct = 1
@@ -1890,8 +1936,7 @@ func (m Model) renderRestoreProgress() string {
 		}
 	}
 
-	box := helpOverlayStyle.Render(b.String())
-	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
+	return b.String()
 }
 
 // renderProgressBar draws a [=====>    ] style bar.

@@ -107,6 +107,13 @@ var (
 				Padding(1, 2).
 				Width(64)
 
+	// Wider overlay for restore confirmation.
+	wideOverlayStyle = lipgloss.NewStyle().
+				Border(lipgloss.RoundedBorder()).
+				BorderForeground(lipgloss.Color("#e94560")).
+				Padding(1, 3).
+				Width(76)
+
 	helpTitleStyle = lipgloss.NewStyle().
 			Bold(true).
 			Foreground(lipgloss.Color("#e94560")).

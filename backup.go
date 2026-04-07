@@ -345,6 +345,23 @@ func performRestore(e *Entry, backupPath string) tea.Cmd {
 
 		docker := dockerCmd(client)
 
+		// Drop non-default extensions first — DROP SCHEMA CASCADE removes
+		// their objects but leaves the pg_extension record, which causes
+		// CREATE EXTENSION IF NOT EXISTS in the dump to be a no-op (types
+		// like geometry end up as <unknown>).
+		dropExtSQL := `DO $$ DECLARE ext RECORD; BEGIN
+FOR ext IN SELECT extname FROM pg_extension WHERE extname != 'plpgsql' LOOP
+EXECUTE 'DROP EXTENSION IF EXISTS ' || quote_ident(ext.extname) || ' CASCADE';
+END LOOP; END $$;`
+		dropExtCmd := fmt.Sprintf("%s exec %s psql -U %s -d %s -c %s",
+			docker,
+			shellQuote(e.Container),
+			shellQuote(e.DBUser),
+			shellQuote(e.Database),
+			shellQuote(dropExtSQL),
+		)
+		_ = runSSHCommandSimple(client, dropExtCmd) // best-effort
+
 		dropSQL := "DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public; GRANT ALL ON SCHEMA public TO public;"
 		dropCmd := fmt.Sprintf("%s exec %s psql -U %s -d %s -c %s",
 			docker,
@@ -453,6 +470,21 @@ func performRestore(e *Entry, backupPath string) tea.Cmd {
 			ch <- restoreProgressMsg{err: fmt.Errorf("psql: %w", waitErr), done: true}
 			return
 		}
+
+		// Terminate all other connections so apps reconnect with fresh
+		// type OID caches (PostGIS types get new OIDs after recreate).
+		terminateSQL := fmt.Sprintf(
+			`SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '%s' AND pid != pg_backend_pid()`,
+			e.Database,
+		)
+		terminateCmd := fmt.Sprintf("%s exec %s psql -U %s -d %s -c %s",
+			docker,
+			shellQuote(e.Container),
+			shellQuote(e.DBUser),
+			shellQuote(e.Database),
+			shellQuote(terminateSQL),
+		)
+		_ = runSSHCommandSimple(client, terminateCmd)
 
 		ch <- restoreProgressMsg{
 			bytesRead: totalSize,

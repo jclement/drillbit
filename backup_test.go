@@ -1,8 +1,10 @@
 package main
 
 import (
+	"compress/gzip"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -12,21 +14,25 @@ func TestBackupFileName(t *testing.T) {
 	if name == "" {
 		t.Fatal("expected non-empty filename")
 	}
-	if !hasExtension(name, ".sql.gz") {
+	if !strings.HasSuffix(name, ".sql.gz") {
 		t.Errorf("expected .sql.gz extension, got %s", name)
 	}
-	if !containsSubstring(name, "prod-server") {
-		t.Errorf("expected host in filename, got %s", name)
+	// Dashes should be sanitized to underscores.
+	if strings.Contains(name, "prod-server") {
+		t.Errorf("expected dashes sanitized, got %s", name)
 	}
-	if !containsSubstring(name, "myapp_db_1") {
+	if !strings.Contains(name, "prod_server") {
+		t.Errorf("expected sanitized host in filename, got %s", name)
+	}
+	if !strings.Contains(name, "myapp_db_1") {
 		t.Errorf("expected container in filename, got %s", name)
 	}
-	if !containsSubstring(name, "mydb") {
+	if !strings.Contains(name, "mydb") {
 		t.Errorf("expected database in filename, got %s", name)
 	}
 	// Verify -- separator format.
-	if !containsSubstring(name, "--") {
-		t.Errorf("expected -- separator in filename, got %s", name)
+	if strings.Count(name, "--") != 3 {
+		t.Errorf("expected 3 -- separators, got %s", name)
 	}
 }
 
@@ -38,6 +44,9 @@ func TestSanitizeFilename(t *testing.T) {
 		{"has/slash", "has_slash"},
 		{"has space", "has_space"},
 		{"has:colon", "has_colon"},
+		{"has-dash", "has_dash"},
+		{"double--dash", "double__dash"},
+		{"mixed/path:name-test", "mixed_path_name_test"},
 	}
 	for _, tt := range tests {
 		got := sanitizeFilename(tt.input)
@@ -50,13 +59,14 @@ func TestSanitizeFilename(t *testing.T) {
 func TestListBackups(t *testing.T) {
 	dir := t.TempDir()
 
-	// Create some test backup files in host--container--db--YYYYMMDD_HHMMSS.sql.gz format.
+	// Create test backup files in host--container--db--YYYYMMDD_HHMMSS.sql.gz format.
 	files := []string{
 		"prod--app_db_1--mydb--20260401_120000.sql.gz",
 		"prod--app_db_1--mydb--20260402_130000.sql.gz",
 		"staging--test_db--testdb--20260403_140000.sql.gz",
 		"not-a-backup.txt",
-		"bad_format.sql.gz", // wrong number of -- parts
+		"bad_format.sql.gz",       // wrong number of -- parts
+		"a--b--c--bad_time.sql.gz", // invalid timestamp
 	}
 
 	for _, f := range files {
@@ -80,6 +90,21 @@ func TestListBackups(t *testing.T) {
 	}
 }
 
+func TestListBackupsNonexistentDir(t *testing.T) {
+	backups := listBackups("/nonexistent/path/that/does/not/exist")
+	if backups != nil {
+		t.Errorf("expected nil for nonexistent dir, got %d entries", len(backups))
+	}
+}
+
+func TestListBackupsEmptyDir(t *testing.T) {
+	dir := t.TempDir()
+	backups := listBackups(dir)
+	if len(backups) != 0 {
+		t.Errorf("expected 0 backups in empty dir, got %d", len(backups))
+	}
+}
+
 func TestSortBackupsForEntry(t *testing.T) {
 	backups := []backupFile{
 		{Host: "prod", Container: "app_db", Database: "mydb", Timestamp: time.Date(2026, 4, 1, 12, 0, 0, 0, time.UTC)},
@@ -94,13 +119,41 @@ func TestSortBackupsForEntry(t *testing.T) {
 	if len(sorted) != 3 {
 		t.Fatalf("expected 3, got %d", len(sorted))
 	}
-	// First two should be matching.
 	if sorted[0].Host != "prod" || sorted[1].Host != "prod" {
 		t.Error("expected matching entries first")
 	}
-	// Third should be non-matching.
 	if sorted[2].Host != "staging" {
 		t.Error("expected non-matching entry last")
+	}
+}
+
+func TestSortBackupsForEntryNoMatch(t *testing.T) {
+	backups := []backupFile{
+		{Host: "staging", Container: "test_db", Database: "testdb"},
+		{Host: "dev", Container: "dev_db", Database: "devdb"},
+	}
+
+	sorted, sepIdx := sortBackupsForEntry(backups, "prod", "app_db", "mydb")
+	if sepIdx != 0 {
+		t.Errorf("expected separator at 0 (no matches), got %d", sepIdx)
+	}
+	if len(sorted) != 2 {
+		t.Fatalf("expected 2, got %d", len(sorted))
+	}
+}
+
+func TestSortBackupsForEntryAllMatch(t *testing.T) {
+	backups := []backupFile{
+		{Host: "prod", Container: "app_db", Database: "mydb"},
+		{Host: "prod", Container: "app_db", Database: "mydb"},
+	}
+
+	sorted, sepIdx := sortBackupsForEntry(backups, "prod", "app_db", "mydb")
+	if sepIdx != 2 {
+		t.Errorf("expected separator at 2 (all match), got %d", sepIdx)
+	}
+	if len(sorted) != 2 {
+		t.Fatalf("expected 2, got %d", len(sorted))
 	}
 }
 
@@ -124,19 +177,65 @@ func TestFormatBytes(t *testing.T) {
 	}
 }
 
-func hasExtension(name, ext string) bool {
-	return len(name) > len(ext) && name[len(name)-len(ext):] == ext
-}
+func TestVerifyGzip(t *testing.T) {
+	t.Run("valid gzip", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "test.gz")
+		f, _ := os.Create(path)
+		gz := gzip.NewWriter(f)
+		gz.Write([]byte("hello world"))
+		gz.Close()
+		f.Close()
 
-func containsSubstring(s, sub string) bool {
-	return len(s) >= len(sub) && (s == sub || len(s) > 0 && findSubstring(s, sub))
-}
-
-func findSubstring(s, sub string) bool {
-	for i := 0; i <= len(s)-len(sub); i++ {
-		if s[i:i+len(sub)] == sub {
-			return true
+		if err := verifyGzip(path); err != nil {
+			t.Errorf("expected valid gzip, got error: %v", err)
 		}
+	})
+
+	t.Run("invalid gzip", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "bad.gz")
+		os.WriteFile(path, []byte("not gzip data"), 0o644)
+
+		if err := verifyGzip(path); err == nil {
+			t.Error("expected error for invalid gzip")
+		}
+	})
+
+	t.Run("nonexistent file", func(t *testing.T) {
+		if err := verifyGzip("/nonexistent/file.gz"); err == nil {
+			t.Error("expected error for nonexistent file")
+		}
+	})
+}
+
+func TestBackupFileNameRoundTrip(t *testing.T) {
+	// Generate a filename and verify it can be parsed back by listBackups.
+	dir := t.TempDir()
+	name := backupFileName("my-host", "my_container", "my-db")
+	path := filepath.Join(dir, name)
+
+	// Create a valid gzip file.
+	f, _ := os.Create(path)
+	gz := gzip.NewWriter(f)
+	gz.Write([]byte("-- SQL dump"))
+	gz.Close()
+	f.Close()
+
+	backups := listBackups(dir)
+	if len(backups) != 1 {
+		t.Fatalf("expected 1 backup, got %d", len(backups))
 	}
-	return false
+
+	b := backups[0]
+	if b.Host != "my_host" { // dashes sanitized
+		t.Errorf("host = %q, want %q", b.Host, "my_host")
+	}
+	if b.Container != "my_container" {
+		t.Errorf("container = %q, want %q", b.Container, "my_container")
+	}
+	if b.Database != "my_db" { // dashes sanitized
+		t.Errorf("database = %q, want %q", b.Database, "my_db")
+	}
+	if b.Timestamp.IsZero() {
+		t.Error("expected non-zero timestamp")
+	}
 }

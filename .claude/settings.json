@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(gofmt -e backup.go)",
+      "Bash(git checkout:*)",
+      "Bash(gofmt -e /Users/jsc/Developer/drillbit/backup.go)"
+    ]
+  }
+}
