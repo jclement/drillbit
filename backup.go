@@ -61,6 +61,7 @@ func sanitizeFilename(s string) string {
 	s = strings.ReplaceAll(s, "\\", "_")
 	s = strings.ReplaceAll(s, " ", "_")
 	s = strings.ReplaceAll(s, ":", "_")
+	s = strings.ReplaceAll(s, "-", "_")
 	return s
 }
 
@@ -550,6 +551,26 @@ func (cr *countingReader) Read(p []byte) (int, error) {
 	n, err := cr.r.Read(p)
 	cr.count.Add(int64(n))
 	return n, err
+}
+
+// verifyGzip checks that a file is valid gzip by reading it to completion.
+func verifyGzip(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	gr, err := gzip.NewReader(f)
+	if err != nil {
+		return err
+	}
+	defer gr.Close()
+
+	if _, err := io.Copy(io.Discard, gr); err != nil {
+		return err
+	}
+	return nil
 }
 
 // formatBytes returns a human-readable byte size.
