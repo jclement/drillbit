@@ -5,7 +5,7 @@ go 1.25.0
 require (
 	charm.land/bubbles/v2 v2.0.0
 	charm.land/bubbletea/v2 v2.0.2
-	charm.land/lipgloss/v2 v2.0.2
+	charm.land/lipgloss/v2 v2.0.3
 	github.com/atotto/clipboard v0.1.4
 	github.com/kevinburke/ssh_config v1.6.0
 	github.com/sahilm/fuzzy v0.1.1
@@ -18,9 +18,9 @@ require (
 	github.com/asaskevich/govalidator v0.0.0-20230301143203-a9d515a09cc2 // indirect
 	github.com/blang/semver v3.5.1+incompatible // indirect
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
-	github.com/charmbracelet/colorprofile v0.4.2 // indirect
+	github.com/charmbracelet/colorprofile v0.4.3 // indirect
 	github.com/charmbracelet/ultraviolet v0.0.0-20260205113103-524a6607adb8 // indirect
-	github.com/charmbracelet/x/ansi v0.11.6 // indirect
+	github.com/charmbracelet/x/ansi v0.11.7 // indirect
 	github.com/charmbracelet/x/term v0.2.2 // indirect
 	github.com/charmbracelet/x/termios v0.1.1 // indirect
 	github.com/charmbracelet/x/windows v0.2.2 // indirect
@@ -59,8 +59,8 @@ require (
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.27.3 // indirect
 	github.com/in-toto/attestation v1.1.2 // indirect
 	github.com/in-toto/in-toto-golang v0.9.0 // indirect
-	github.com/lucasb-eyer/go-colorful v1.3.0 // indirect
-	github.com/mattn/go-runewidth v0.0.20 // indirect
+	github.com/lucasb-eyer/go-colorful v1.4.0 // indirect
+	github.com/mattn/go-runewidth v0.0.23 // indirect
 	github.com/muesli/cancelreader v0.2.2 // indirect
 	github.com/oklog/ulid v1.3.1 // indirect
 	github.com/opencontainers/go-digest v1.0.0 // indirect
@@ -85,7 +85,7 @@ require (
 	golang.org/x/mod v0.33.0 // indirect
 	golang.org/x/net v0.51.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect
-	golang.org/x/sys v0.42.0 // indirect
+	golang.org/x/sys v0.43.0 // indirect
 	golang.org/x/term v0.41.0 // indirect
 	golang.org/x/text v0.35.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20250929231259-57b25ae835d4 // indirect
