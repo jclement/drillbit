@@ -8,7 +8,7 @@ require (
 	charm.land/lipgloss/v2 v2.0.2
 	github.com/atotto/clipboard v0.1.4
 	github.com/kevinburke/ssh_config v1.6.0
-	github.com/sahilm/fuzzy v0.1.1
+	github.com/sahilm/fuzzy v0.1.2
 	github.com/sigstore/sigstore-go v1.1.4
 	go.yaml.in/yaml/v3 v3.0.4
 	golang.org/x/crypto v0.49.0
